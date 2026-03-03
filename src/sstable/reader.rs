@@ -1,12 +1,16 @@
 use std::{
     fs::File,
     io::{Read, Seek, SeekFrom},
+    ops::Bound,
     path::{Path, PathBuf},
 };
 
 use parking_lot::Mutex;
 
-use crate::{error::Result, types::InternalEntry};
+use crate::{
+    error::Result,
+    types::{InternalEntry, Key, ScanBounds},
+};
 
 use super::{
     FOOTER_TRAILER_LEN, SST_MAGIC, SST_VERSION, SsTableMeta, block::find_in_block,
@@ -20,6 +24,17 @@ pub struct SsTableReader {
     meta: SsTableMeta,
     index: Vec<super::IndexEntry>,
     bloom: BloomFilter,
+}
+
+pub struct SsTableRangeIter {
+    file: File,
+    file_len: u64,
+    bounds: ScanBounds,
+    visible_seq: u64,
+    block_handles: Vec<super::BlockHandle>,
+    block_index_cursor: usize,
+    in_block_entries: Vec<InternalEntry>,
+    in_block_cursor: usize,
 }
 
 const MAX_SECTION_BYTES: usize = 128 * 1024 * 1024;
@@ -172,9 +187,85 @@ impl SsTableReader {
         Ok(all_entries)
     }
 
+    /// Creates an iterator over entries within `bounds` visible up to `visible_seq`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying table file handle cannot be cloned.
+    pub fn iter_range(&self, bounds: &ScanBounds, visible_seq: u64) -> Result<SsTableRangeIter> {
+        if !table_overlaps_bounds(&self.meta, bounds) {
+            let file = {
+                let file = self.file.lock();
+                file.try_clone()?
+            };
+            return Ok(SsTableRangeIter {
+                file,
+                file_len: self.file_len,
+                bounds: clone_scan_bounds(bounds),
+                visible_seq,
+                block_handles: Vec::new(),
+                block_index_cursor: 0,
+                in_block_entries: Vec::new(),
+                in_block_cursor: 0,
+            });
+        }
+
+        let block_handles = block_handles_for_bounds(&self.index, bounds);
+        let file = {
+            let file = self.file.lock();
+            file.try_clone()?
+        };
+
+        Ok(SsTableRangeIter {
+            file,
+            file_len: self.file_len,
+            bounds: clone_scan_bounds(bounds),
+            visible_seq,
+            block_handles,
+            block_index_cursor: 0,
+            in_block_entries: Vec::new(),
+            in_block_cursor: 0,
+        })
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.file_path
+    }
+}
+
+impl SsTableRangeIter {
+    /// Advances this range iterator and returns the next matching entry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a selected table block cannot be read or decoded.
+    pub fn next_entry(&mut self) -> Result<Option<InternalEntry>> {
+        loop {
+            while self.in_block_cursor < self.in_block_entries.len() {
+                let index = self.in_block_cursor;
+                self.in_block_cursor = self.in_block_cursor.saturating_add(1);
+                let entry = self.in_block_entries[index].clone();
+                if entry.seq > self.visible_seq {
+                    continue;
+                }
+                if !key_in_bounds(entry.key.as_ref(), &self.bounds) {
+                    continue;
+                }
+                return Ok(Some(entry));
+            }
+
+            if self.block_index_cursor >= self.block_handles.len() {
+                return Ok(None);
+            }
+
+            let handle = self.block_handles[self.block_index_cursor];
+            self.block_index_cursor = self.block_index_cursor.saturating_add(1);
+            let block =
+                read_handle_payload(&mut self.file, self.file_len, handle.offset, handle.len)?;
+            self.in_block_entries = super::block::decode_block_entries(&block)?;
+            self.in_block_cursor = 0;
+        }
     }
 }
 
@@ -188,6 +279,85 @@ fn locate_candidate_block(index_entries: &[super::IndexEntry], key: &[u8]) -> Op
                 None
             }
         }
+    }
+}
+
+fn block_handles_for_bounds(
+    index_entries: &[super::IndexEntry],
+    bounds: &ScanBounds,
+) -> Vec<super::BlockHandle> {
+    if index_entries.is_empty() {
+        return Vec::new();
+    }
+
+    let start_index = match &bounds.start {
+        Bound::Unbounded => 0,
+        Bound::Included(key) | Bound::Excluded(key) => {
+            let Some(pos) = locate_candidate_block(index_entries, key.as_ref()) else {
+                return Vec::new();
+            };
+            pos
+        }
+    };
+
+    let end_index = match &bounds.end {
+        Bound::Unbounded => index_entries.len().saturating_sub(1),
+        Bound::Included(key) | Bound::Excluded(key) => {
+            locate_candidate_block(index_entries, key.as_ref())
+                .unwrap_or_else(|| index_entries.len().saturating_sub(1))
+        }
+    };
+
+    if start_index > end_index {
+        return Vec::new();
+    }
+
+    index_entries[start_index..=end_index]
+        .iter()
+        .map(|entry| entry.handle)
+        .collect()
+}
+
+fn table_overlaps_bounds(meta: &SsTableMeta, bounds: &ScanBounds) -> bool {
+    let above_start = match &bounds.start {
+        Bound::Included(start) => meta.max_key.as_ref() >= start.as_ref(),
+        Bound::Excluded(start) => meta.max_key.as_ref() > start.as_ref(),
+        Bound::Unbounded => true,
+    };
+    let below_end = match &bounds.end {
+        Bound::Included(end) => meta.min_key.as_ref() <= end.as_ref(),
+        Bound::Excluded(end) => meta.min_key.as_ref() < end.as_ref(),
+        Bound::Unbounded => true,
+    };
+    above_start && below_end
+}
+
+fn key_in_bounds(key: &[u8], bounds: &ScanBounds) -> bool {
+    let above_start = match &bounds.start {
+        Bound::Included(start) => key >= start.as_ref(),
+        Bound::Excluded(start) => key > start.as_ref(),
+        Bound::Unbounded => true,
+    };
+    let below_end = match &bounds.end {
+        Bound::Included(end) => key <= end.as_ref(),
+        Bound::Excluded(end) => key < end.as_ref(),
+        Bound::Unbounded => true,
+    };
+    above_start && below_end
+}
+
+fn clone_bound(bound: &Bound<Key>) -> Bound<Key> {
+    match bound {
+        Bound::Included(key) => Bound::Included(key.clone()),
+        Bound::Excluded(key) => Bound::Excluded(key.clone()),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
+
+fn clone_scan_bounds(bounds: &ScanBounds) -> ScanBounds {
+    ScanBounds {
+        start: clone_bound(&bounds.start),
+        end: clone_bound(&bounds.end),
     }
 }
 

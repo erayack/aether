@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, mem, mem::size_of};
 
-use crate::types::{InternalEntry, Key, ValueEntry};
+use crate::types::{InternalEntry, Key, ScanBounds, ValueEntry};
 
 const ENTRY_OVERHEAD_BYTES: usize = 48;
 const SEQUENCE_BYTES: usize = size_of::<u64>();
@@ -47,6 +47,51 @@ impl MemTable {
     #[must_use]
     pub fn into_sorted_entries(self) -> Vec<InternalEntry> {
         self.entries.into_values().collect()
+    }
+
+    #[must_use]
+    pub fn range_entries(&self, bounds: &ScanBounds, visible_seq: u64) -> Vec<InternalEntry> {
+        if has_invalid_bounds(bounds) {
+            return Vec::new();
+        }
+
+        let start = clone_bound(&bounds.start);
+        let end = clone_bound(&bounds.end);
+
+        self.entries
+            .range((start, end))
+            .filter_map(|(_, entry)| (entry.seq <= visible_seq).then_some(entry.clone()))
+            .collect()
+    }
+}
+
+fn has_invalid_bounds(bounds: &ScanBounds) -> bool {
+    use std::cmp::Ordering;
+    use std::ops::Bound;
+
+    let (
+        Bound::Included(start) | Bound::Excluded(start),
+        Bound::Included(end) | Bound::Excluded(end),
+    ) = (&bounds.start, &bounds.end)
+    else {
+        return false;
+    };
+
+    match start.as_ref().cmp(end.as_ref()) {
+        Ordering::Greater => true,
+        Ordering::Equal => matches!(
+            (&bounds.start, &bounds.end),
+            (Bound::Excluded(_), Bound::Excluded(_) | Bound::Included(_))
+        ),
+        Ordering::Less => false,
+    }
+}
+
+fn clone_bound(bound: &std::ops::Bound<Key>) -> std::ops::Bound<Key> {
+    match bound {
+        std::ops::Bound::Included(key) => std::ops::Bound::Included(key.clone()),
+        std::ops::Bound::Excluded(key) => std::ops::Bound::Excluded(key.clone()),
+        std::ops::Bound::Unbounded => std::ops::Bound::Unbounded,
     }
 }
 
@@ -152,7 +197,8 @@ mod tests {
     use bytes::Bytes;
 
     use super::{ENTRY_OVERHEAD_BYTES, MemTable, MemTableSet, SEQUENCE_BYTES};
-    use crate::types::{InternalEntry, ValueEntry};
+    use crate::types::{InternalEntry, ScanBounds, ValueEntry};
+    use std::ops::Bound;
 
     fn put_entry(seq: u64, key: &'static [u8], value: &'static [u8]) -> InternalEntry {
         InternalEntry {
@@ -223,6 +269,37 @@ mod tests {
             ValueEntry::Put(value) => assert_eq!(value.as_ref(), b"new"),
             ValueEntry::Tombstone => panic!("unexpected tombstone"),
         }
+    }
+
+    #[test]
+    fn range_entries_applies_bounds_and_visible_seq() {
+        let mut table = MemTable::new();
+        table.upsert(put_entry(5, b"a", b"1"));
+        table.upsert(put_entry(6, b"b", b"2"));
+        table.upsert(put_entry(7, b"c", b"3"));
+        table.upsert(put_entry(8, b"d", b"4"));
+
+        let bounds = ScanBounds {
+            start: Bound::Included(Bytes::from_static(b"b")),
+            end: Bound::Excluded(Bytes::from_static(b"d")),
+        };
+        let entries = table.range_entries(&bounds, 6);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key.as_ref(), b"b");
+        assert_eq!(entries[0].seq, 6);
+    }
+
+    #[test]
+    fn range_entries_returns_empty_for_invalid_bounds_instead_of_panicking() {
+        let mut table = MemTable::new();
+        table.upsert(put_entry(1, b"a", b"1"));
+
+        let bounds = ScanBounds {
+            start: Bound::Included(Bytes::from_static(b"z")),
+            end: Bound::Excluded(Bytes::from_static(b"a")),
+        };
+        let entries = table.range_entries(&bounds, 10);
+        assert!(entries.is_empty());
     }
 
     #[test]

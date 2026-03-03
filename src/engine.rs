@@ -21,14 +21,20 @@ use crate::{
     flush::{FlushJob, spawn_flush_worker},
     manifest::{ManifestState, ManifestStore},
     memtable::{MemTable, MemTableSet},
+    merge_iter::{MergeIterator, MergeMode, SourceCursor},
     metrics::{MetricsHandle, MetricsSnapshot},
     sstable::{SsTableMeta, reader::SsTableReader, writer::SsTableWriter},
-    types::{InternalEntry, Key, KvStore, Value, ValueEntry},
+    types::{
+        BatchOp, InternalEntry, Key, KvStore, ScanBounds, ScanItem, ScanOptions, Value, ValueEntry,
+        WriteBatch,
+    },
     wal::{WalOp, WalWriter, replay_wal},
 };
 
 const SSTABLE_FILE_EXT: &str = "sst";
 const DEFAULT_BACKGROUND_CHANNEL_CAPACITY: usize = 128;
+const SOURCE_RANK_L0_BASE: u32 = 2;
+const SOURCE_RANK_L1_BASE: u32 = 1_000_000;
 
 #[derive(Clone)]
 pub struct AetherEngine {
@@ -43,6 +49,8 @@ struct Inner {
     memtable_max_bytes: usize,
     sst_target_block_bytes: usize,
     l0_compaction_trigger: usize,
+    max_write_batch_ops: usize,
+    max_write_batch_bytes: usize,
     metrics_log_interval: Option<Duration>,
     last_metrics_log_at: Mutex<Option<Instant>>,
     background_error: Mutex<Option<String>>,
@@ -69,6 +77,19 @@ struct TableCache {
 struct TableHandle {
     meta: SsTableMeta,
     reader: Arc<SsTableReader>,
+}
+
+struct ReadSnapshot {
+    visible_seq: u64,
+    mutable_entries: Vec<InternalEntry>,
+    immutable_entries: Vec<InternalEntry>,
+    l0_tables: Vec<TableSource>,
+    l1_tables: Vec<TableSource>,
+}
+
+struct TableSource {
+    reader: Arc<SsTableReader>,
+    source_rank: u32,
 }
 
 struct CompactionSelection {
@@ -153,6 +174,8 @@ impl AetherEngine {
                 memtable_max_bytes: opts.memtable_max_bytes,
                 sst_target_block_bytes: opts.sst_target_block_bytes,
                 l0_compaction_trigger: opts.l0_compaction_trigger,
+                max_write_batch_ops: opts.max_write_batch_ops,
+                max_write_batch_bytes: opts.max_write_batch_bytes,
                 metrics_log_interval: opts
                     .enable_metrics_log_interval
                     .filter(|millis| *millis > 0)
@@ -209,9 +232,91 @@ impl AetherEngine {
         <Self as KvStore>::flush(self)
     }
 
+    /// Scans key-value entries in a bounded range.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if snapshot construction or source iteration fails.
+    pub fn scan(&self, options: ScanOptions) -> Result<Vec<ScanItem>> {
+        <Self as KvStore>::scan(self, options)
+    }
+
+    /// Applies a batch of write operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if validation fails or batch writes are unsupported.
+    pub fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        <Self as KvStore>::write_batch(self, batch)
+    }
+
     #[must_use]
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
         self.inner.metrics.snapshot()
+    }
+
+    fn build_read_snapshot(&self, options: &ScanOptions) -> Result<ReadSnapshot> {
+        let read_state = self.inner.read_state.read();
+        let visible_seq = read_state
+            .manifest_snapshot
+            .next_sequence_number
+            .saturating_sub(1);
+        let mutable_entries = read_state
+            .memtables
+            .mutable()
+            .range_entries(&options.bounds, visible_seq);
+        let immutable_entries = read_state
+            .memtables
+            .immutable()
+            .map_or_else(Vec::new, |memtable| {
+                memtable.range_entries(&options.bounds, visible_seq)
+            });
+
+        let mut l0_tables = Vec::new();
+        for (index, table) in read_state.table_cache.l0.iter().enumerate() {
+            if !table_overlaps_bounds(&table.meta, &options.bounds) {
+                continue;
+            }
+
+            let offset = u32::try_from(index)
+                .map_err(|_| invalid_data("L0 table count exceeds source-rank range"))?;
+            let source_rank = SOURCE_RANK_L0_BASE
+                .checked_add(offset)
+                .ok_or_else(|| invalid_data("L0 source-rank overflow"))?;
+
+            l0_tables.push(TableSource {
+                reader: Arc::clone(&table.reader),
+                source_rank,
+            });
+        }
+
+        let mut l1_tables = Vec::new();
+        for (index, table) in read_state.table_cache.l1.iter().enumerate() {
+            if !table_overlaps_bounds(&table.meta, &options.bounds) {
+                continue;
+            }
+
+            let offset = u32::try_from(index)
+                .map_err(|_| invalid_data("L1 table count exceeds source-rank range"))?;
+            let source_rank = SOURCE_RANK_L1_BASE
+                .checked_add(offset)
+                .ok_or_else(|| invalid_data("L1 source-rank overflow"))?;
+
+            l1_tables.push(TableSource {
+                reader: Arc::clone(&table.reader),
+                source_rank,
+            });
+        }
+
+        drop(read_state);
+
+        Ok(ReadSnapshot {
+            visible_seq,
+            mutable_entries,
+            immutable_entries,
+            l0_tables,
+            l1_tables,
+        })
     }
 
     fn apply_write(&self, key: Key, value: ValueEntry) -> Result<()> {
@@ -632,6 +737,78 @@ impl KvStore for AetherEngine {
         }
         result
     }
+
+    fn scan(&self, options: ScanOptions) -> Result<Vec<ScanItem>> {
+        self.ensure_background_workers_healthy()?;
+
+        if has_invalid_scan_bounds(&options.bounds) {
+            return Err(invalid_input("scan start bound is greater than end bound").into());
+        }
+
+        if matches!(options.limit, Some(0)) {
+            return Ok(Vec::new());
+        }
+
+        let snapshot = self.build_read_snapshot(&options)?;
+        let mut sources = vec![
+            SourceCursor::from_entries(snapshot.mutable_entries, 0),
+            SourceCursor::from_entries(snapshot.immutable_entries, 1),
+        ];
+
+        for source in snapshot.l0_tables {
+            let TableSource {
+                reader,
+                source_rank,
+                ..
+            } = source;
+            let iter = reader.iter_range(&options.bounds, snapshot.visible_seq)?;
+            sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
+        }
+
+        for source in snapshot.l1_tables {
+            let TableSource {
+                reader,
+                source_rank,
+                ..
+            } = source;
+            let iter = reader.iter_range(&options.bounds, snapshot.visible_seq)?;
+            sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
+        }
+
+        let limit = options.limit.unwrap_or(usize::MAX);
+        let mut output = Vec::new();
+        let mut merge_iter = MergeIterator::new(MergeMode::UserScan, sources);
+        while output.len() < limit {
+            let Some(entry) = merge_iter.next_entry()? else {
+                break;
+            };
+
+            if let ValueEntry::Put(value) = entry.value {
+                output.push(ScanItem {
+                    key: entry.key,
+                    value,
+                });
+            }
+        }
+
+        Ok(output)
+    }
+
+    fn write_batch(&self, batch: WriteBatch) -> Result<()> {
+        self.ensure_background_workers_healthy()?;
+
+        if batch.ops.len() > self.inner.max_write_batch_ops {
+            return Err(invalid_input("write batch exceeds max_write_batch_ops").into());
+        }
+
+        let estimated_bytes = estimate_write_batch_bytes(&batch);
+        if estimated_bytes > self.inner.max_write_batch_bytes {
+            return Err(invalid_input("write batch exceeds max_write_batch_bytes").into());
+        }
+
+        let _ = batch;
+        Err(unsupported("write_batch atomic semantics are not implemented yet").into())
+    }
 }
 
 impl BackgroundTaskChannels {
@@ -832,6 +1009,45 @@ fn parse_sstable_filename(file_name: &str) -> Option<(u8, u64)> {
     Some((level, table_id))
 }
 
+fn table_overlaps_bounds(meta: &SsTableMeta, bounds: &ScanBounds) -> bool {
+    use std::ops::Bound;
+
+    let above_start = match &bounds.start {
+        Bound::Included(start) => meta.max_key.as_ref() >= start.as_ref(),
+        Bound::Excluded(start) => meta.max_key.as_ref() > start.as_ref(),
+        Bound::Unbounded => true,
+    };
+    let below_end = match &bounds.end {
+        Bound::Included(end) => meta.min_key.as_ref() <= end.as_ref(),
+        Bound::Excluded(end) => meta.min_key.as_ref() < end.as_ref(),
+        Bound::Unbounded => true,
+    };
+
+    above_start && below_end
+}
+
+fn has_invalid_scan_bounds(bounds: &ScanBounds) -> bool {
+    use std::cmp::Ordering;
+    use std::ops::Bound;
+
+    let (
+        Bound::Included(start) | Bound::Excluded(start),
+        Bound::Included(end) | Bound::Excluded(end),
+    ) = (&bounds.start, &bounds.end)
+    else {
+        return false;
+    };
+
+    match start.as_ref().cmp(end.as_ref()) {
+        Ordering::Greater => true,
+        Ordering::Equal => matches!(
+            (&bounds.start, &bounds.end),
+            (Bound::Excluded(_), Bound::Excluded(_) | Bound::Included(_))
+        ),
+        Ordering::Less => false,
+    }
+}
+
 fn sstable_path(db_dir: &Path, table_id: u64, level: u8) -> PathBuf {
     db_dir.join(format!("l{level}-t{table_id}.{SSTABLE_FILE_EXT}"))
 }
@@ -915,6 +1131,23 @@ fn max_table_id(levels: &[Vec<SsTableMeta>]) -> Option<u64> {
         .max()
 }
 
+fn estimate_write_batch_bytes(batch: &WriteBatch) -> usize {
+    batch.ops.iter().fold(0_usize, |acc, op| {
+        let op_bytes = match op {
+            BatchOp::Put { key, value } => key
+                .len()
+                .saturating_add(value.len())
+                .saturating_add(size_of::<u8>())
+                .saturating_add(size_of::<u32>() * 2),
+            BatchOp::Delete { key } => key
+                .len()
+                .saturating_add(size_of::<u8>())
+                .saturating_add(size_of::<u32>()),
+        };
+        acc.saturating_add(op_bytes)
+    })
+}
+
 const fn estimate_wal_record_bytes(key_len: usize, value: &ValueEntry) -> usize {
     const CRC_LEN: usize = size_of::<u32>();
     const RECORD_LEN_LEN: usize = size_of::<u32>();
@@ -941,17 +1174,30 @@ fn invalid_data(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
+fn invalid_input(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
+}
+
+fn unsupported(message: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Unsupported, message)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         fs,
+        ops::Bound,
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use bytes::Bytes;
 
     use super::AetherEngine;
-    use crate::config::EngineOptions;
+    use crate::{
+        config::EngineOptions,
+        error::AetherError,
+        types::{BatchOp, ScanBounds, ScanOptions, WriteBatch},
+    };
 
     fn temp_db_dir(prefix: &str) -> std::path::PathBuf {
         let nanos = SystemTime::now()
@@ -1080,5 +1326,535 @@ mod tests {
             put_after_failure.is_err(),
             "engine should reject writes after a background flush failure"
         );
+    }
+
+    #[test]
+    fn scan_includes_last_table_blocks_when_end_bound_exceeds_table_max_key() {
+        let db_dir = temp_db_dir("scan-end-bound-over-max");
+        let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.put(Bytes::from_static(b"c"), Bytes::from_static(b"3")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+
+        let items = match engine.scan(ScanOptions {
+            bounds: ScanBounds {
+                start: Bound::Unbounded,
+                end: Bound::Included(Bytes::from_static(b"zz")),
+            },
+            limit: None,
+        }) {
+            Ok(items) => items,
+            Err(err) => panic!("scan should succeed: {err}"),
+        };
+        let keys = items
+            .iter()
+            .map(|item| item.key.as_ref().to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(keys, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn scan_rejects_invalid_bounds() {
+        let db_dir = temp_db_dir("scan-invalid-bounds");
+        let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        let scan_result = engine.scan(ScanOptions {
+            bounds: ScanBounds {
+                start: Bound::Included(Bytes::from_static(b"z")),
+                end: Bound::Excluded(Bytes::from_static(b"a")),
+            },
+            limit: None,
+        });
+        assert!(scan_result.is_err(), "scan should reject invalid bounds");
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn write_batch_is_rejected_until_atomic_semantics_are_implemented() {
+        let db_dir = temp_db_dir("write-batch-unsupported");
+        let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        let batch = WriteBatch {
+            ops: vec![BatchOp::Put {
+                key: Bytes::from_static(b"k"),
+                value: Bytes::from_static(b"v"),
+            }],
+        };
+        let result = engine.write_batch(batch);
+        match result {
+            Ok(()) => panic!("write_batch should be unsupported"),
+            Err(AetherError::Io(err)) => {
+                assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+            }
+            Err(err) => panic!("unexpected write_batch error: {err}"),
+        }
+
+        let value = match engine.get(b"k") {
+            Ok(value) => value,
+            Err(err) => panic!("get should succeed: {err}"),
+        };
+        assert_eq!(value, None, "write_batch should not apply partial writes");
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    fn scan_keys(items: &[crate::types::ScanItem]) -> Vec<Vec<u8>> {
+        items
+            .iter()
+            .map(|item| item.key.as_ref().to_vec())
+            .collect()
+    }
+
+    fn scan_kv(items: &[crate::types::ScanItem]) -> Vec<(Vec<u8>, Vec<u8>)> {
+        items
+            .iter()
+            .map(|item| (item.key.as_ref().to_vec(), item.value.as_ref().to_vec()))
+            .collect()
+    }
+
+    fn unbounded_scan() -> ScanOptions {
+        ScanOptions {
+            bounds: ScanBounds {
+                start: Bound::Unbounded,
+                end: Bound::Unbounded,
+            },
+            limit: None,
+        }
+    }
+
+    #[test]
+    fn scan_unbounded_returns_all_live_keys_in_order() {
+        let db_dir = temp_db_dir("scan-unbounded-all");
+        let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        for (key, value) in [
+            (b"c", b"3"),
+            (b"a", b"1"),
+            (b"e", b"5"),
+            (b"b", b"2"),
+            (b"d", b"4"),
+        ] {
+            if let Err(err) = engine.put(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value))
+            {
+                panic!("put should succeed: {err}");
+            }
+        }
+
+        let items = match engine.scan(unbounded_scan()) {
+            Ok(items) => items,
+            Err(err) => panic!("scan should succeed: {err}"),
+        };
+        assert_eq!(
+            scan_keys(&items),
+            vec![
+                b"a".to_vec(),
+                b"b".to_vec(),
+                b"c".to_vec(),
+                b"d".to_vec(),
+                b"e".to_vec()
+            ]
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn scan_included_bounds_filters_range() {
+        let db_dir = temp_db_dir("scan-included-bounds");
+        let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        for (key, value) in [
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+            (b"e", b"5"),
+        ] {
+            if let Err(err) = engine.put(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value))
+            {
+                panic!("put should succeed: {err}");
+            }
+        }
+
+        let items = match engine.scan(ScanOptions {
+            bounds: ScanBounds {
+                start: Bound::Included(Bytes::from_static(b"b")),
+                end: Bound::Included(Bytes::from_static(b"d")),
+            },
+            limit: None,
+        }) {
+            Ok(items) => items,
+            Err(err) => panic!("scan should succeed: {err}"),
+        };
+        assert_eq!(
+            scan_keys(&items),
+            vec![b"b".to_vec(), b"c".to_vec(), b"d".to_vec()]
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn scan_excluded_bounds_filters_range() {
+        let db_dir = temp_db_dir("scan-excluded-bounds");
+        let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        for (key, value) in [
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+            (b"e", b"5"),
+        ] {
+            if let Err(err) = engine.put(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value))
+            {
+                panic!("put should succeed: {err}");
+            }
+        }
+
+        let items = match engine.scan(ScanOptions {
+            bounds: ScanBounds {
+                start: Bound::Excluded(Bytes::from_static(b"b")),
+                end: Bound::Excluded(Bytes::from_static(b"e")),
+            },
+            limit: None,
+        }) {
+            Ok(items) => items,
+            Err(err) => panic!("scan should succeed: {err}"),
+        };
+        assert_eq!(scan_keys(&items), vec![b"c".to_vec(), b"d".to_vec()]);
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn scan_respects_limit() {
+        let db_dir = temp_db_dir("scan-limit");
+        let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        for (key, value) in [
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+            (b"e", b"5"),
+        ] {
+            if let Err(err) = engine.put(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value))
+            {
+                panic!("put should succeed: {err}");
+            }
+        }
+
+        let items = match engine.scan(ScanOptions {
+            bounds: ScanBounds {
+                start: Bound::Unbounded,
+                end: Bound::Unbounded,
+            },
+            limit: Some(2),
+        }) {
+            Ok(items) => items,
+            Err(err) => panic!("scan should succeed: {err}"),
+        };
+        assert_eq!(scan_keys(&items), vec![b"a".to_vec(), b"b".to_vec()]);
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn scan_zero_limit_returns_empty() {
+        let db_dir = temp_db_dir("scan-zero-limit");
+        let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+            panic!("put should succeed: {err}");
+        }
+
+        let items = match engine.scan(ScanOptions {
+            bounds: ScanBounds {
+                start: Bound::Unbounded,
+                end: Bound::Unbounded,
+            },
+            limit: Some(0),
+        }) {
+            Ok(items) => items,
+            Err(err) => panic!("scan should succeed: {err}"),
+        };
+        assert!(items.is_empty(), "scan with limit=0 should return empty");
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn scan_mutable_overrides_flushed_l0() {
+        let db_dir = temp_db_dir("scan-mutable-over-l0");
+
+        let items = {
+            let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+                Ok(engine) => engine,
+                Err(err) => panic!("open should succeed: {err}"),
+            };
+
+            if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"old")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"new")) {
+                panic!("put should succeed: {err}");
+            }
+
+            match engine.scan(unbounded_scan()) {
+                Ok(items) => items,
+                Err(err) => panic!("scan should succeed: {err}"),
+            }
+        };
+
+        assert_eq!(scan_kv(&items), vec![(b"k".to_vec(), b"new".to_vec())]);
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn scan_tombstone_hides_flushed_key() {
+        let db_dir = temp_db_dir("scan-tombstone");
+
+        let items = {
+            let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
+                Ok(engine) => engine,
+                Err(err) => panic!("open should succeed: {err}"),
+            };
+
+            if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            if let Err(err) = engine.delete(Bytes::from_static(b"a")) {
+                panic!("delete should succeed: {err}");
+            }
+
+            match engine.scan(unbounded_scan()) {
+                Ok(items) => items,
+                Err(err) => panic!("scan should succeed: {err}"),
+            }
+        };
+
+        assert_eq!(scan_kv(&items), vec![(b"b".to_vec(), b"2".to_vec())]);
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn scan_across_l0_and_l1_after_compaction() {
+        let db_dir = temp_db_dir("scan-l0-l1-compaction");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.l0_compaction_trigger = 2;
+
+        {
+            let engine = match AetherEngine::open(opts.clone()) {
+                Ok(engine) => engine,
+                Err(err) => panic!("open should succeed: {err}"),
+            };
+
+            if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            if let Err(err) = engine.put(Bytes::from_static(b"c"), Bytes::from_static(b"3")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.put(Bytes::from_static(b"d"), Bytes::from_static(b"4")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            // Allow background compaction to settle before drop.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        // Reopen to get a deterministic view after compaction (L1).
+        let items = {
+            let engine = match AetherEngine::open(opts) {
+                Ok(engine) => engine,
+                Err(err) => panic!("reopen should succeed: {err}"),
+            };
+
+            // Add a fresh L0 after compaction.
+            if let Err(err) = engine.put(Bytes::from_static(b"e"), Bytes::from_static(b"5")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            match engine.scan(unbounded_scan()) {
+                Ok(items) => items,
+                Err(err) => panic!("scan should succeed: {err}"),
+            }
+        };
+
+        assert_eq!(
+            scan_kv(&items),
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+                (b"e".to_vec(), b"5".to_vec()),
+            ]
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn scan_precedence_mutable_over_l0_over_l1() {
+        let db_dir = temp_db_dir("scan-precedence");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.l0_compaction_trigger = 2;
+
+        // Phase 1: create L1 data via compaction.
+        {
+            let engine = match AetherEngine::open(opts.clone()) {
+                Ok(engine) => engine,
+                Err(err) => panic!("open should succeed: {err}"),
+            };
+
+            if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"v1")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            // Second L0 flush triggers compaction (trigger=2).
+            if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"v2")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+
+        // Phase 2: reopen, add L0 + mutable layers.
+        let (items, get_value) = {
+            let engine = match AetherEngine::open(opts) {
+                Ok(engine) => engine,
+                Err(err) => panic!("reopen should succeed: {err}"),
+            };
+
+            // Write into L0.
+            if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"v3")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            // Write into mutable memtable.
+            if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"v4")) {
+                panic!("put should succeed: {err}");
+            }
+
+            let scan_items = match engine.scan(unbounded_scan()) {
+                Ok(items) => items,
+                Err(err) => panic!("scan should succeed: {err}"),
+            };
+
+            // Consistency check: point-get should agree.
+            let value = match engine.get(b"k") {
+                Ok(value) => value,
+                Err(err) => panic!("get should succeed: {err}"),
+            };
+
+            (scan_items, value)
+        };
+
+        assert_eq!(
+            scan_kv(&items),
+            vec![(b"k".to_vec(), b"v4".to_vec())],
+            "mutable memtable value should win over L0 and L1"
+        );
+        assert_eq!(get_value, Some(Bytes::from_static(b"v4")));
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
     }
 }

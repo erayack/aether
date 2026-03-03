@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use std::ops::Bound;
 
 pub type Key = Bytes;
 pub type Value = Bytes;
@@ -22,6 +23,35 @@ pub enum ReadResult {
     Found(Value),
     Deleted,
     NotFound,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanBounds {
+    pub start: Bound<Key>,
+    pub end: Bound<Key>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanOptions {
+    pub bounds: ScanBounds,
+    pub limit: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScanItem {
+    pub key: Key,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BatchOp {
+    Put { key: Key, value: Value },
+    Delete { key: Key },
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WriteBatch {
+    pub ops: Vec<BatchOp>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -65,4 +95,19 @@ pub trait KvStore {
     ///
     /// Returns an engine-specific flush error.
     fn flush(&self) -> crate::error::Result<()>;
+
+    /// Scans the keyspace within the provided bounds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine-specific scan error.
+    fn scan(&self, options: ScanOptions) -> crate::error::Result<Vec<ScanItem>>;
+
+    /// Applies multiple write operations.
+    ///
+    /// # Errors
+    ///
+    /// Returns an engine-specific batch write error, including when batch writes
+    /// are not supported by the current engine implementation.
+    fn write_batch(&self, batch: WriteBatch) -> crate::error::Result<()>;
 }
