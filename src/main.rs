@@ -8,7 +8,7 @@ use aether_storage::{
 };
 use anyhow::{Context, Result, bail};
 use bytes::Bytes;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 use tracing::{error, info};
 
 #[derive(Debug, Parser)]
@@ -121,12 +121,21 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+    #[command(group(
+        ArgGroup::new("batch_input")
+            .args(["ops_json", "ops"])
+            .required(true)
+            .multiple(false)
+    ))]
     WriteBatch {
         #[arg(long)]
         db: PathBuf,
         #[arg(long)]
         ops_json: Option<PathBuf>,
-        #[arg(long = "op")]
+        #[arg(
+            long = "op",
+            help = "Secondary mode. Format: put:<k>:<v> or delete:<k>"
+        )]
         ops: Vec<String>,
     },
 }
@@ -648,4 +657,101 @@ fn format_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut output, "{byte:02x}");
     }
     output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BatchOp, BatchOpInput, load_write_batch_from_json, parse_batch_op_input,
+        parse_inline_batch_ops, resolve_write_batch,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn parse_batch_op_input_parses_put_and_delete() {
+        let put = parse_batch_op_input(BatchOpInput::Put {
+            key: "k".to_string(),
+            value: "v".to_string(),
+        });
+        assert!(put.is_ok(), "put op should parse");
+        match put {
+            Ok(BatchOp::Put { key, value }) => {
+                assert_eq!(key.as_ref(), b"k");
+                assert_eq!(value.as_ref(), b"v");
+            }
+            Ok(BatchOp::Delete { .. }) => panic!("expected put op"),
+            Err(err) => panic!("expected successful parse, got {err}"),
+        }
+
+        let delete = parse_batch_op_input(BatchOpInput::Delete {
+            key: "k".to_string(),
+        });
+        assert!(delete.is_ok(), "delete op should parse");
+        match delete {
+            Ok(BatchOp::Delete { key }) => assert_eq!(key.as_ref(), b"k"),
+            Ok(BatchOp::Put { .. }) => panic!("expected delete op"),
+            Err(err) => panic!("expected successful parse, got {err}"),
+        }
+    }
+
+    #[test]
+    fn parse_inline_batch_ops_parses_repeated_ops() {
+        let ops = vec!["put:k1:v1".to_string(), "delete:k2".to_string()];
+        let parsed = parse_inline_batch_ops(&ops);
+        assert!(parsed.is_ok(), "inline ops should parse");
+        let batch = match parsed {
+            Ok(batch) => batch,
+            Err(err) => panic!("expected successful parse, got {err}"),
+        };
+        assert_eq!(batch.ops.len(), 2);
+    }
+
+    #[test]
+    fn resolve_write_batch_rejects_both_sources() {
+        let ops = vec!["delete:k".to_string()];
+        let result = resolve_write_batch(Some(Path::new("ops.json")), &ops);
+        assert!(result.is_err(), "should reject --ops-json with --op");
+    }
+
+    #[test]
+    fn load_write_batch_from_json_reads_deterministic_format() {
+        let raw = r#"{
+  "ops": [
+    { "op": "put", "key": "k1", "value": "v1" },
+    { "op": "delete", "key": "k2" }
+  ]
+}"#;
+
+        let tmp_dir = std::env::temp_dir();
+        let path = tmp_dir.join(format!(
+            "aether-write-batch-{}-{}.json",
+            std::process::id(),
+            monotonic_nanos()
+        ));
+
+        let write_result = std::fs::write(&path, raw.as_bytes());
+        assert!(write_result.is_ok(), "failed to create temp ops file");
+
+        let loaded = load_write_batch_from_json(&path);
+        let cleanup_result = std::fs::remove_file(&path);
+        assert!(
+            cleanup_result.is_ok(),
+            "failed to remove temp ops file {}",
+            path.display()
+        );
+
+        assert!(loaded.is_ok(), "json batch should parse");
+        let batch = match loaded {
+            Ok(batch) => batch,
+            Err(err) => panic!("expected successful parse, got {err}"),
+        };
+        assert_eq!(batch.ops.len(), 2);
+    }
+
+    fn monotonic_nanos() -> u128 {
+        match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(duration) => duration.as_nanos(),
+            Err(err) => panic!("system clock should be after unix epoch: {err}"),
+        }
+    }
 }

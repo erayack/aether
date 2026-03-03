@@ -6,6 +6,7 @@ pub mod memtable;
 pub mod merge_iter;
 pub mod metrics;
 pub mod types;
+mod write_batch;
 
 pub mod compaction;
 pub mod flush;

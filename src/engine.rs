@@ -28,7 +28,7 @@ use crate::{
         BatchOp, InternalEntry, Key, KvStore, ScanBounds, ScanItem, ScanOptions, Value, ValueEntry,
         WriteBatch,
     },
-    wal::{WalOp, WalWriter, replay_wal},
+    wal::{WalBatchOp, WalOp, WalWriter, replay_wal},
 };
 
 const SSTABLE_FILE_EXT: &str = "sst";
@@ -185,12 +185,20 @@ impl AetherEngine {
             }),
         };
 
-        let flush_engine = engine.clone();
-        let _ = spawn_flush_worker(flush_rx, move |job| flush_engine.handle_flush_job(job));
+        let flush_inner = Arc::downgrade(&engine.inner);
+        let _ = spawn_flush_worker(flush_rx, move |job| {
+            let Some(inner) = flush_inner.upgrade() else {
+                return Ok(());
+            };
+            Self { inner }.handle_flush_job(job)
+        });
 
-        let compaction_engine = engine.clone();
+        let compaction_inner = Arc::downgrade(&engine.inner);
         let _ = spawn_compaction_worker(compaction_rx, move |job| {
-            compaction_engine.handle_compaction_job(job)
+            let Some(inner) = compaction_inner.upgrade() else {
+                return Ok(());
+            };
+            Self { inner }.handle_compaction_job(job)
         });
 
         Ok(engine)
@@ -344,6 +352,86 @@ impl AetherEngine {
             key,
             value,
         });
+
+        write_state.manifest.next_sequence_number = write_state.wal.next_sequence_number();
+        write_state.manifest.wal_durable_checkpoint_offset = write_state.wal.write_offset();
+        read_state.manifest_snapshot.next_sequence_number =
+            write_state.manifest.next_sequence_number;
+        read_state.manifest_snapshot.wal_durable_checkpoint_offset =
+            write_state.manifest.wal_durable_checkpoint_offset;
+
+        let mut flush_job: Option<FlushJob> = None;
+        let rotated = read_state
+            .memtables
+            .maybe_rotate(self.inner.memtable_max_bytes.max(1));
+        if rotated && let Some(memtable) = read_state.memtables.take_immutable() {
+            let generation = write_state.manifest.wal_generation;
+            flush_job = Some(FlushJob {
+                generation,
+                memtable,
+                completion: None,
+            });
+        }
+
+        drop(read_state);
+        drop(write_state);
+
+        if let Some(job) = flush_job {
+            self.inner.background.enqueue_flush(job)?;
+        }
+
+        self.maybe_emit_metrics_snapshot("write");
+        Ok(())
+    }
+
+    fn apply_batch(&self, batch: WriteBatch) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+
+        let mut write_state = self.inner.write_state.lock();
+        let mut read_state = self.inner.read_state.write();
+
+        let wal_append_started_at = Instant::now();
+        let append = {
+            let wal_batch_ops = batch
+                .ops
+                .iter()
+                .map(|op| match op {
+                    BatchOp::Put { key, value } => WalBatchOp::Put {
+                        key: key.as_ref(),
+                        value: value.as_ref(),
+                    },
+                    BatchOp::Delete { key } => WalBatchOp::Delete { key: key.as_ref() },
+                })
+                .collect::<Vec<_>>();
+            write_state.wal.append(WalOp::Batch {
+                ops: &wal_batch_ops,
+            })?
+        };
+        let estimated_wal_bytes = estimate_wal_batch_record_bytes(&batch);
+        self.inner
+            .metrics
+            .record_wal_append_with_latency(estimated_wal_bytes, wal_append_started_at.elapsed());
+
+        for op in batch.ops {
+            match op {
+                BatchOp::Put { key, value } => {
+                    read_state.memtables.mutable_mut().upsert(InternalEntry {
+                        seq: append.seq,
+                        key,
+                        value: ValueEntry::Put(value),
+                    });
+                }
+                BatchOp::Delete { key } => {
+                    read_state.memtables.mutable_mut().upsert(InternalEntry {
+                        seq: append.seq,
+                        key,
+                        value: ValueEntry::Tombstone,
+                    });
+                }
+            }
+        }
 
         write_state.manifest.next_sequence_number = write_state.wal.next_sequence_number();
         write_state.manifest.wal_durable_checkpoint_offset = write_state.wal.write_offset();
@@ -801,13 +889,13 @@ impl KvStore for AetherEngine {
             return Err(invalid_input("write batch exceeds max_write_batch_ops").into());
         }
 
-        let estimated_bytes = estimate_write_batch_bytes(&batch);
+        let estimated_bytes = batch.approx_bytes();
         if estimated_bytes > self.inner.max_write_batch_bytes {
             return Err(invalid_input("write batch exceeds max_write_batch_bytes").into());
         }
 
-        let _ = batch;
-        Err(unsupported("write_batch atomic semantics are not implemented yet").into())
+        let canonical_batch = batch.canonicalize_last_write_wins();
+        self.apply_batch(canonical_batch)
     }
 }
 
@@ -1131,23 +1219,6 @@ fn max_table_id(levels: &[Vec<SsTableMeta>]) -> Option<u64> {
         .max()
 }
 
-fn estimate_write_batch_bytes(batch: &WriteBatch) -> usize {
-    batch.ops.iter().fold(0_usize, |acc, op| {
-        let op_bytes = match op {
-            BatchOp::Put { key, value } => key
-                .len()
-                .saturating_add(value.len())
-                .saturating_add(size_of::<u8>())
-                .saturating_add(size_of::<u32>() * 2),
-            BatchOp::Delete { key } => key
-                .len()
-                .saturating_add(size_of::<u8>())
-                .saturating_add(size_of::<u32>()),
-        };
-        acc.saturating_add(op_bytes)
-    })
-}
-
 const fn estimate_wal_record_bytes(key_len: usize, value: &ValueEntry) -> usize {
     const CRC_LEN: usize = size_of::<u32>();
     const RECORD_LEN_LEN: usize = size_of::<u32>();
@@ -1170,16 +1241,42 @@ const fn estimate_wal_record_bytes(key_len: usize, value: &ValueEntry) -> usize 
         .saturating_add(value_len)
 }
 
+fn estimate_wal_batch_record_bytes(batch: &WriteBatch) -> usize {
+    const CRC_LEN: usize = size_of::<u32>();
+    const RECORD_LEN_LEN: usize = size_of::<u32>();
+    const SEQ_LEN: usize = size_of::<u64>();
+    const OP_LEN: usize = size_of::<u8>();
+    const BATCH_COUNT_LEN: usize = size_of::<u32>();
+    const FIELD_LEN_LEN: usize = size_of::<u32>();
+
+    let payload_len = batch.ops.iter().fold(
+        SEQ_LEN
+            .saturating_add(OP_LEN)
+            .saturating_add(BATCH_COUNT_LEN),
+        |acc, op| {
+            let (key_len, value_len) = match op {
+                BatchOp::Put { key, value } => (key.len(), value.len()),
+                BatchOp::Delete { key } => (key.len(), 0),
+            };
+            acc.saturating_add(OP_LEN)
+                .saturating_add(FIELD_LEN_LEN)
+                .saturating_add(key_len)
+                .saturating_add(FIELD_LEN_LEN)
+                .saturating_add(value_len)
+        },
+    );
+
+    CRC_LEN
+        .saturating_add(RECORD_LEN_LEN)
+        .saturating_add(payload_len)
+}
+
 fn invalid_data(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
 fn invalid_input(message: &'static str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidInput, message)
-}
-
-fn unsupported(message: &'static str) -> std::io::Error {
-    std::io::Error::new(std::io::ErrorKind::Unsupported, message)
 }
 
 #[cfg(test)]
@@ -1195,7 +1292,6 @@ mod tests {
     use super::AetherEngine;
     use crate::{
         config::EngineOptions,
-        error::AetherError,
         types::{BatchOp, ScanBounds, ScanOptions, WriteBatch},
     };
 
@@ -1393,33 +1489,43 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_is_rejected_until_atomic_semantics_are_implemented() {
-        let db_dir = temp_db_dir("write-batch-unsupported");
+    fn write_batch_applies_atomically() {
+        let db_dir = temp_db_dir("write-batch-atomic");
         let engine = match AetherEngine::open(EngineOptions::with_db_dir(db_dir.clone())) {
             Ok(engine) => engine,
             Err(err) => panic!("open should succeed: {err}"),
         };
 
         let batch = WriteBatch {
-            ops: vec![BatchOp::Put {
-                key: Bytes::from_static(b"k"),
-                value: Bytes::from_static(b"v"),
-            }],
+            ops: vec![
+                BatchOp::Put {
+                    key: Bytes::from_static(b"a"),
+                    value: Bytes::from_static(b"1"),
+                },
+                BatchOp::Put {
+                    key: Bytes::from_static(b"b"),
+                    value: Bytes::from_static(b"2"),
+                },
+                BatchOp::Delete {
+                    key: Bytes::from_static(b"a"),
+                },
+            ],
         };
-        let result = engine.write_batch(batch);
-        match result {
-            Ok(()) => panic!("write_batch should be unsupported"),
-            Err(AetherError::Io(err)) => {
-                assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-            }
-            Err(err) => panic!("unexpected write_batch error: {err}"),
+        if let Err(err) = engine.write_batch(batch) {
+            panic!("write_batch should succeed: {err}");
         }
 
-        let value = match engine.get(b"k") {
+        let value_a = match engine.get(b"a") {
             Ok(value) => value,
             Err(err) => panic!("get should succeed: {err}"),
         };
-        assert_eq!(value, None, "write_batch should not apply partial writes");
+        assert_eq!(value_a, None);
+
+        let value_b = match engine.get(b"b") {
+            Ok(value) => value,
+            Err(err) => panic!("get should succeed: {err}"),
+        };
+        assert_eq!(value_b, Some(Bytes::from_static(b"2")));
 
         if let Err(err) = fs::remove_dir_all(&db_dir) {
             panic!("cleanup should succeed: {err}");
