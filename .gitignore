@@ -1,0 +1,24 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo cache/metadata (keep Cargo.lock tracked by default)
+/.cargo/
+
+# Local runtime data
+/data/
+/tmp/
+/*.log
+/*.wal
+/*.sst
+
+# macOS
+.DS_Store
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+

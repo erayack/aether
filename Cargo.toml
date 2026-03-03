@@ -1,0 +1,69 @@
+[package]
+name = "aether-storage"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.97"
+bytes = { version = "1.10.1", features = ["serde"] }
+clap = { version = "4.5.32", features = ["derive", "env"] }
+crc32fast = "1.4.2"
+fs2 = "0.4.3"
+parking_lot = "0.12.3"
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+thiserror = "2.0.12"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+
+[lints.rust]
+unsafe_code = "forbid"
+warnings = "deny"
+future_incompatible = { level = "deny", priority = -1 }
+rust_2018_idioms = { level = "deny", priority = -1 }
+unused_lifetimes = "deny"
+unused_qualifications = "deny"
+unused_must_use = "deny"
+unreachable_pub = "deny"
+
+[lints.clippy]
+all = { level = "deny", priority = 10 }
+perf = { level = "deny", priority = 9 }
+pedantic = { level = "warn", priority = 3 }
+nursery = { level = "warn", priority = 2 }
+# Escalate nursery/pedantic lints to deny
+needless_collect = { level = "deny", priority = 11 }
+redundant_clone = { level = "deny", priority = 11 }
+unnecessary_wraps = { level = "deny", priority = 11 }
+# Restriction lints (not covered by groups above)
+unwrap_used = { level = "deny", priority = 8 }
+expect_used = { level = "deny", priority = 8 }
+dbg_macro = { level = "deny", priority = 8 }
+todo = { level = "warn", priority = 8 }
+unimplemented = { level = "deny", priority = 8 }
+print_stdout = { level = "deny", priority = 8 }
+print_stderr = { level = "deny", priority = 8 }
+string_to_string = { level = "deny", priority = 8 }
+mem_forget = { level = "deny", priority = 8 }
+
+[profile.dev]
+opt-level = 1
+debug = 2
+debug-assertions = true
+overflow-checks = true
+incremental = true
+codegen-units = 256
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "debuginfo"
+debug = 1
+incremental = false
+overflow-checks = true
+
+[profile.test]
+opt-level = 1
+debug = 2
