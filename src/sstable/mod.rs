@@ -7,11 +7,14 @@ use std::mem::size_of;
 
 use bytes::Bytes;
 
-use crate::error::Result;
+use crate::{config::CompressionCodec, error::Result};
 
 const SST_MAGIC: u64 = 0x4154_4852_5353_5431;
-const SST_VERSION: u32 = 1;
+pub(crate) const SST_VERSION: u32 = 2;
 const DEFAULT_BLOCK_TARGET_BYTES: usize = 32 * 1024;
+const DEFAULT_PREFIX_RESTART_INTERVAL: u16 = 16;
+pub(super) const DATA_BLOCK_HEADER_LEN: usize =
+    size_of::<u8>() + size_of::<u32>() + size_of::<u32>();
 const FOOTER_TRAILER_LEN: usize = size_of::<u32>() + size_of::<u32>() + size_of::<u64>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,6 +38,82 @@ pub struct SsTableMeta {
     pub max_seq: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlockEncodingKind {
+    Plain,
+    Prefix,
+}
+
+impl BlockEncodingKind {
+    const fn code(self) -> u8 {
+        match self {
+            Self::Plain => 0,
+            Self::Prefix => 1,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self> {
+        match code {
+            0 => Ok(Self::Plain),
+            1 => Ok(Self::Prefix),
+            _ => Err(invalid_data("SSTable footer has unknown block encoding kind").into()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FooterCompressionCodec {
+    None,
+    Snappy,
+    Zstd,
+}
+
+impl FooterCompressionCodec {
+    const fn code(self) -> u8 {
+        match self {
+            Self::None => 0,
+            Self::Snappy => 1,
+            Self::Zstd => 2,
+        }
+    }
+
+    fn from_code(code: u8) -> Result<Self> {
+        match code {
+            0 => Ok(Self::None),
+            1 => Ok(Self::Snappy),
+            2 => Ok(Self::Zstd),
+            _ => Err(invalid_data("SSTable footer has unknown compression codec").into()),
+        }
+    }
+}
+
+impl From<CompressionCodec> for FooterCompressionCodec {
+    fn from(value: CompressionCodec) -> Self {
+        match value {
+            CompressionCodec::None => Self::None,
+            CompressionCodec::Snappy => Self::Snappy,
+            CompressionCodec::Zstd => Self::Zstd,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FooterMetadata {
+    pub block_encoding_kind: BlockEncodingKind,
+    pub default_compression_codec: FooterCompressionCodec,
+    pub prefix_restart_interval: u16,
+}
+
+impl Default for FooterMetadata {
+    fn default() -> Self {
+        Self {
+            block_encoding_kind: BlockEncodingKind::Plain,
+            default_compression_codec: FooterCompressionCodec::None,
+            prefix_restart_interval: DEFAULT_PREFIX_RESTART_INTERVAL,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TableFooter {
     pub index: BlockHandle,
@@ -43,6 +122,37 @@ struct TableFooter {
     pub max_key: Bytes,
     pub entry_count: u64,
     pub max_seq: u64,
+    pub metadata: FooterMetadata,
+}
+
+impl TableFooter {
+    const fn index_handle(&self) -> BlockHandle {
+        self.index
+    }
+
+    const fn bloom_handle(&self) -> BlockHandle {
+        self.bloom
+    }
+
+    const fn entry_count(&self) -> u64 {
+        self.entry_count
+    }
+
+    const fn max_seq(&self) -> u64 {
+        self.max_seq
+    }
+
+    const fn min_key(&self) -> &Bytes {
+        &self.min_key
+    }
+
+    const fn max_key(&self) -> &Bytes {
+        &self.max_key
+    }
+
+    const fn metadata(&self) -> FooterMetadata {
+        self.metadata
+    }
 }
 
 fn encode_index_entries(index_entries: &[IndexEntry]) -> Result<Vec<u8>> {
@@ -111,7 +221,9 @@ fn encode_footer(footer: &TableFooter) -> Result<Vec<u8>> {
     out.extend_from_slice(footer.min_key.as_ref());
     out.extend_from_slice(&max_key_len.to_le_bytes());
     out.extend_from_slice(footer.max_key.as_ref());
-
+    out.push(footer.metadata.block_encoding_kind.code());
+    out.push(footer.metadata.default_compression_codec.code());
+    out.extend_from_slice(&footer.metadata.prefix_restart_interval.to_le_bytes());
     Ok(out)
 }
 
@@ -135,6 +247,10 @@ fn decode_footer(raw: &[u8]) -> Result<TableFooter> {
     })?;
     let max_key = read_slice(raw, &mut cursor, max_key_len)?;
 
+    let block_encoding_kind = BlockEncodingKind::from_code(read_u8(raw, &mut cursor)?)?;
+    let default_compression_codec = FooterCompressionCodec::from_code(read_u8(raw, &mut cursor)?)?;
+    let prefix_restart_interval = read_u16(raw, &mut cursor)?;
+
     if cursor != raw.len() {
         return Err(invalid_data("SSTable footer contains trailing bytes").into());
     }
@@ -152,6 +268,11 @@ fn decode_footer(raw: &[u8]) -> Result<TableFooter> {
         max_key: Bytes::copy_from_slice(max_key),
         entry_count,
         max_seq,
+        metadata: FooterMetadata {
+            block_encoding_kind,
+            default_compression_codec,
+            prefix_restart_interval,
+        },
     })
 }
 
@@ -168,12 +289,40 @@ fn decode_footer_trailer(raw: &[u8]) -> Result<(u32, u32, u64)> {
     Ok((footer_len, version, magic))
 }
 
-fn encode_footer_trailer(footer_len: u32) -> Vec<u8> {
+fn encode_footer_trailer(footer_len: u32, version: u32) -> Vec<u8> {
     let mut out = Vec::with_capacity(FOOTER_TRAILER_LEN);
     out.extend_from_slice(&footer_len.to_le_bytes());
-    out.extend_from_slice(&SST_VERSION.to_le_bytes());
+    out.extend_from_slice(&version.to_le_bytes());
     out.extend_from_slice(&SST_MAGIC.to_le_bytes());
     out
+}
+
+pub(super) fn encode_data_block_header(
+    is_compressed: bool,
+    raw_len: u32,
+    stored_len: u32,
+) -> [u8; DATA_BLOCK_HEADER_LEN] {
+    let mut out = [0_u8; DATA_BLOCK_HEADER_LEN];
+    out[0] = u8::from(is_compressed);
+    out[1..5].copy_from_slice(&raw_len.to_le_bytes());
+    out[5..9].copy_from_slice(&stored_len.to_le_bytes());
+    out
+}
+
+pub(super) fn decode_data_block_header(raw: &[u8]) -> Result<(bool, u32, u32)> {
+    if raw.len() != DATA_BLOCK_HEADER_LEN {
+        return Err(invalid_data("SSTable data block header has invalid size").into());
+    }
+
+    let is_compressed = match raw[0] {
+        0 => false,
+        1 => true,
+        _ => return Err(invalid_data("SSTable data block header has unknown flag").into()),
+    };
+    let raw_len = u32::from_le_bytes([raw[1], raw[2], raw[3], raw[4]]);
+    let stored_len = u32::from_le_bytes([raw[5], raw[6], raw[7], raw[8]]);
+
+    Ok((is_compressed, raw_len, stored_len))
 }
 
 fn invalid_data(message: &'static str) -> std::io::Error {
@@ -208,6 +357,29 @@ fn read_u64(input: &[u8], cursor: &mut usize) -> std::io::Result<u64> {
     Ok(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
+}
+
+fn read_u16(input: &[u8], cursor: &mut usize) -> std::io::Result<u16> {
+    let end = cursor
+        .checked_add(size_of::<u16>())
+        .ok_or_else(|| invalid_data("SSTable decode cursor overflow"))?;
+    let bytes = input
+        .get(*cursor..end)
+        .ok_or_else(|| invalid_data("SSTable payload truncated while reading u16"))?;
+    *cursor = end;
+
+    Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_u8(input: &[u8], cursor: &mut usize) -> std::io::Result<u8> {
+    let end = cursor
+        .checked_add(size_of::<u8>())
+        .ok_or_else(|| invalid_data("SSTable decode cursor overflow"))?;
+    let bytes = input
+        .get(*cursor..end)
+        .ok_or_else(|| invalid_data("SSTable payload truncated while reading u8"))?;
+    *cursor = end;
+    Ok(bytes[0])
 }
 
 fn read_slice<'a>(input: &'a [u8], cursor: &mut usize, len: usize) -> std::io::Result<&'a [u8]> {

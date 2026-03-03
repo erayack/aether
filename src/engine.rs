@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     fs,
     mem::size_of,
     path::{Path, PathBuf},
@@ -16,14 +16,17 @@ use tracing::{error, info};
 
 use crate::{
     compaction::{CompactionJob, CompactionReason, spawn_compaction_worker},
-    config::EngineOptions,
+    config::{CompressionCodec, EngineOptions},
     error::Result,
     flush::{FlushJob, spawn_flush_worker},
     manifest::{ManifestState, ManifestStore},
     memtable::{MemTable, MemTableSet},
     merge_iter::{MergeIterator, MergeMode, SourceCursor},
     metrics::{MetricsHandle, MetricsSnapshot},
-    sstable::{SsTableMeta, reader::SsTableReader, writer::SsTableWriter},
+    sstable::{
+        BlockEncodingKind, FooterMetadata, SsTableMeta, reader::SsTableReader,
+        writer::SsTableWriter,
+    },
     types::{
         BatchOp, InternalEntry, Key, KvStore, ScanBounds, ScanItem, ScanOptions, Value, ValueEntry,
         WriteBatch,
@@ -51,6 +54,9 @@ struct Inner {
     l0_compaction_trigger: usize,
     max_write_batch_ops: usize,
     max_write_batch_bytes: usize,
+    compression_codec: CompressionCodec,
+    prefix_restart_interval: u16,
+    min_compress_size_bytes: usize,
     metrics_log_interval: Option<Duration>,
     last_metrics_log_at: Mutex<Option<Instant>>,
     background_error: Mutex<Option<String>>,
@@ -97,6 +103,14 @@ struct CompactionSelection {
     selected_l1: Vec<SsTableMeta>,
     min_key: Key,
     max_key: Key,
+}
+
+#[derive(Clone, Copy)]
+struct SstableWriteSettings {
+    block_target_bytes: usize,
+    compression_codec: CompressionCodec,
+    prefix_restart_interval: u16,
+    min_compress_size_bytes: usize,
 }
 
 struct BackgroundTaskChannels {
@@ -176,6 +190,9 @@ impl AetherEngine {
                 l0_compaction_trigger: opts.l0_compaction_trigger,
                 max_write_batch_ops: opts.max_write_batch_ops,
                 max_write_batch_bytes: opts.max_write_batch_bytes,
+                compression_codec: opts.compression_codec,
+                prefix_restart_interval: opts.prefix_restart_interval,
+                min_compress_size_bytes: opts.min_compress_size_bytes,
                 metrics_log_interval: opts
                     .enable_metrics_log_interval
                     .filter(|millis| *millis > 0)
@@ -504,6 +521,9 @@ impl AetherEngine {
                 job.memtable,
                 table_id,
                 self.inner.sst_target_block_bytes,
+                self.inner.compression_codec,
+                self.inner.prefix_restart_interval,
+                self.inner.min_compress_size_bytes,
             )?;
             let output_table_bytes =
                 table_file_size_bytes(&db_dir, table.meta.table_id, table.meta.level)?;
@@ -553,11 +573,7 @@ impl AetherEngine {
         result
     }
 
-    fn handle_compaction_job(&self, job: CompactionJob) -> Result<()> {
-        match job.reason {
-            CompactionReason::L0ThresholdReached => {}
-        }
-
+    fn handle_compaction_job(&self, _job: CompactionJob) -> Result<()> {
         let compaction_started_at = Instant::now();
 
         let mut write_state = self.inner.write_state.lock();
@@ -601,12 +617,13 @@ impl AetherEngine {
                 .checked_add(1)
                 .ok_or_else(|| invalid_data("SSTable table-id overflow"))?;
 
+            let settings = sstable_write_settings(&self.inner);
             Some(write_entries_to_sstable(
                 &write_state.db_dir,
                 &output_entries,
                 table_id,
                 1,
-                self.inner.sst_target_block_bytes,
+                settings,
             )?)
         };
         let output_table_ids = new_l1_table
@@ -1006,38 +1023,108 @@ fn collect_compaction_entries(
     table_cache: &TableCache,
     selection: &CompactionSelection,
 ) -> Result<Vec<InternalEntry>> {
-    let mut merged: BTreeMap<Key, InternalEntry> = BTreeMap::new();
+    let sources = build_compaction_sources(table_cache, selection)?;
+    let drop_tombstones = can_drop_compaction_tombstones(table_cache, selection);
 
-    for table in &table_cache.l0 {
-        for entry in table.reader.scan_all_entries()? {
-            match merged.get(entry.key.as_ref()) {
-                Some(existing) if existing.seq > entry.seq => {}
-                _ => {
-                    merged.insert(entry.key.clone(), entry);
-                }
-            }
-        }
-    }
-
-    for table in &table_cache.l1 {
-        if table.meta.max_key.as_ref() < selection.min_key.as_ref()
-            || table.meta.min_key.as_ref() > selection.max_key.as_ref()
-        {
+    let mut output_entries = Vec::new();
+    let mut merge_iter = MergeIterator::new(MergeMode::Compaction, sources);
+    while let Some(entry) = merge_iter.next_entry()? {
+        if drop_tombstones && matches!(entry.value, ValueEntry::Tombstone) {
             continue;
         }
-        for entry in table.reader.scan_all_entries()? {
-            match merged.get(entry.key.as_ref()) {
-                Some(existing) if existing.seq > entry.seq => {}
-                _ => {
-                    merged.insert(entry.key.clone(), entry);
-                }
-            }
-        }
+        output_entries.push(entry);
     }
 
-    let mut output_entries = merged.into_values().collect::<Vec<_>>();
-    output_entries.retain(|entry| !matches!(entry.value, ValueEntry::Tombstone));
     Ok(output_entries)
+}
+
+fn build_compaction_sources(
+    table_cache: &TableCache,
+    selection: &CompactionSelection,
+) -> Result<Vec<SourceCursor>> {
+    let selected_l0_ids = selection
+        .selected_l0
+        .iter()
+        .map(|meta| meta.table_id)
+        .collect::<HashSet<_>>();
+    let selected_l1_ids = selection
+        .selected_l1
+        .iter()
+        .map(|meta| meta.table_id)
+        .collect::<HashSet<_>>();
+
+    let mut sources = Vec::new();
+
+    for (index, table) in table_cache.l0.iter().enumerate() {
+        if !selected_l0_ids.contains(&table.meta.table_id) {
+            continue;
+        }
+
+        let offset = u32::try_from(index)
+            .map_err(|_| invalid_data("L0 table count exceeds source-rank range"))?;
+        let source_rank = SOURCE_RANK_L0_BASE
+            .checked_add(offset)
+            .ok_or_else(|| invalid_data("L0 source-rank overflow"))?;
+        let iter = table.reader.iter_all()?;
+        sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
+    }
+
+    for (index, table) in table_cache.l1.iter().enumerate() {
+        if !selected_l1_ids.contains(&table.meta.table_id) {
+            continue;
+        }
+
+        let offset = u32::try_from(index)
+            .map_err(|_| invalid_data("L1 table count exceeds source-rank range"))?;
+        let source_rank = SOURCE_RANK_L1_BASE
+            .checked_add(offset)
+            .ok_or_else(|| invalid_data("L1 source-rank overflow"))?;
+        let iter = table.reader.iter_all()?;
+        sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
+    }
+
+    Ok(sources)
+}
+
+fn can_drop_compaction_tombstones(
+    table_cache: &TableCache,
+    selection: &CompactionSelection,
+) -> bool {
+    if !l1_ranges_non_overlapping(&table_cache.l1) {
+        return false;
+    }
+
+    let overlapping_l1_ids = table_cache
+        .l1
+        .iter()
+        .filter(|table| {
+            table_key_ranges_overlap(
+                &table.meta,
+                selection.min_key.as_ref(),
+                selection.max_key.as_ref(),
+            )
+        })
+        .map(|table| table.meta.table_id)
+        .collect::<HashSet<_>>();
+    let selected_l1_ids = selection
+        .selected_l1
+        .iter()
+        .map(|meta| meta.table_id)
+        .collect::<HashSet<_>>();
+
+    overlapping_l1_ids == selected_l1_ids
+}
+
+fn l1_ranges_non_overlapping(l1_tables: &[TableHandle]) -> bool {
+    l1_tables.windows(2).all(|pair| {
+        let left = &pair[0].meta;
+        let right = &pair[1].meta;
+        left.max_key.as_ref() < right.min_key.as_ref()
+    })
+}
+
+fn table_key_ranges_overlap(meta: &SsTableMeta, min_key: &[u8], max_key: &[u8]) -> bool {
+    !(meta.max_key.as_ref() < min_key || meta.min_key.as_ref() > max_key)
 }
 
 fn discover_sstables(db_dir: &Path) -> Result<Vec<TableHandle>> {
@@ -1144,18 +1231,41 @@ fn wal_path_for_generation(db_dir: &Path, wal_generation: u64) -> PathBuf {
     db_dir.join(format!("wal-{wal_generation}.log"))
 }
 
+const fn sstable_write_settings(inner: &Inner) -> SstableWriteSettings {
+    SstableWriteSettings {
+        block_target_bytes: inner.sst_target_block_bytes,
+        compression_codec: inner.compression_codec,
+        prefix_restart_interval: inner.prefix_restart_interval,
+        min_compress_size_bytes: inner.min_compress_size_bytes,
+    }
+}
+
 fn flush_memtable_to_sstable(
     db_dir: &Path,
     mutable: MemTable,
     table_id: u64,
     block_target_bytes: usize,
+    compression_codec: CompressionCodec,
+    prefix_restart_interval: u16,
+    min_compress_size_bytes: usize,
 ) -> Result<TableHandle> {
     let entries = mutable.into_sorted_entries();
     if entries.is_empty() {
         return Err(invalid_data("cannot flush empty memtable").into());
     }
 
-    write_entries_to_sstable(db_dir, &entries, table_id, 0, block_target_bytes)
+    write_entries_to_sstable(
+        db_dir,
+        &entries,
+        table_id,
+        0,
+        SstableWriteSettings {
+            block_target_bytes,
+            compression_codec,
+            prefix_restart_interval,
+            min_compress_size_bytes,
+        },
+    )
 }
 
 fn write_entries_to_sstable(
@@ -1163,15 +1273,25 @@ fn write_entries_to_sstable(
     entries: &[InternalEntry],
     table_id: u64,
     level: u8,
-    block_target_bytes: usize,
+    settings: SstableWriteSettings,
 ) -> Result<TableHandle> {
     if entries.is_empty() {
         return Err(invalid_data("cannot flush empty entry set").into());
     }
 
     let path = sstable_path(db_dir, table_id, level);
-    let mut writer =
-        SsTableWriter::create_with_block_target(&path, table_id, level, block_target_bytes)?;
+    let mut writer = SsTableWriter::create_with_block_target_and_options(
+        &path,
+        table_id,
+        level,
+        settings.block_target_bytes,
+        FooterMetadata {
+            block_encoding_kind: BlockEncodingKind::Prefix,
+            default_compression_codec: settings.compression_codec.into(),
+            prefix_restart_interval: settings.prefix_restart_interval,
+        },
+        settings.min_compress_size_bytes,
+    )?;
     for entry in entries {
         writer.add_entry(entry)?;
     }

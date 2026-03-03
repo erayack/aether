@@ -8,7 +8,10 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeMode {
+    /// User-visible scan mode: resolve latest version per key and hide tombstones.
     UserScan,
+    /// Compaction mode: resolve latest version per key and return tombstones as-is.
+    /// Tombstone retention/drop policy is decided by the compaction caller.
     Compaction,
 }
 

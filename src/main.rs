@@ -45,9 +45,17 @@ struct RuntimeArgs {
     max_write_batch_bytes: Option<usize>,
     #[arg(long, value_enum, global = true)]
     compression_codec: Option<CompressionCodecArg>,
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Prefix restart interval for prefix-encoded SST blocks; must be > 0"
+    )]
     prefix_restart_interval: Option<u16>,
-    #[arg(long, global = true)]
+    #[arg(
+        long,
+        global = true,
+        help = "Minimum raw block size to consider compression; 0 enables attempt on all blocks"
+    )]
     min_compress_size_bytes: Option<usize>,
 }
 
@@ -205,9 +213,19 @@ fn resolve_config(cli: &Cli) -> Result<ResolvedRuntimeConfig> {
         engine_options.compression_codec = codec.into();
     }
     if let Some(interval) = cli.runtime.prefix_restart_interval {
+        if interval == 0 {
+            bail!("--prefix-restart-interval must be > 0");
+        }
         engine_options.prefix_restart_interval = interval;
     }
     if let Some(bytes) = cli.runtime.min_compress_size_bytes {
+        if bytes > engine_options.sst_target_block_bytes {
+            bail!(
+                "--min-compress-size-bytes cannot exceed --sst-target-block-bytes ({} > {})",
+                bytes,
+                engine_options.sst_target_block_bytes
+            );
+        }
         engine_options.min_compress_size_bytes = bytes;
     }
 
@@ -662,10 +680,11 @@ fn format_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchOp, BatchOpInput, load_write_batch_from_json, parse_batch_op_input,
-        parse_inline_batch_ops, resolve_write_batch,
+        BatchOp, BatchOpInput, Cli, Command, CompressionCodecArg, FsyncPolicyArg, RuntimeArgs,
+        load_write_batch_from_json, parse_batch_op_input, parse_inline_batch_ops, resolve_config,
+        resolve_write_batch,
     };
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn parse_batch_op_input_parses_put_and_delete() {
@@ -748,10 +767,84 @@ mod tests {
         assert_eq!(batch.ops.len(), 2);
     }
 
+    #[test]
+    fn resolve_config_rejects_zero_prefix_restart_interval() {
+        let cli = build_cli(RuntimeArgs {
+            prefix_restart_interval: Some(0),
+            ..default_runtime_args()
+        });
+        let result = resolve_config(&cli);
+        assert!(result.is_err(), "zero restart interval should be rejected");
+    }
+
+    #[test]
+    fn resolve_config_rejects_min_compress_larger_than_block_target() {
+        let cli = build_cli(RuntimeArgs {
+            sst_target_block_bytes: Some(1024),
+            min_compress_size_bytes: Some(2048),
+            ..default_runtime_args()
+        });
+        let result = resolve_config(&cli);
+        assert!(
+            result.is_err(),
+            "min compress threshold larger than target block should be rejected"
+        );
+    }
+
+    #[test]
+    fn resolve_config_applies_runtime_compression_knobs() {
+        let cli = build_cli(RuntimeArgs {
+            compression_codec: Some(CompressionCodecArg::Zstd),
+            prefix_restart_interval: Some(32),
+            min_compress_size_bytes: Some(512),
+            sst_target_block_bytes: Some(4096),
+            ..default_runtime_args()
+        });
+        let resolved = resolve_config(&cli);
+        assert!(resolved.is_ok(), "config should resolve");
+        let resolved = match resolved {
+            Ok(resolved) => resolved,
+            Err(err) => panic!("expected successful resolve, got {err}"),
+        };
+        assert_eq!(
+            resolved.engine_options.compression_codec,
+            aether_storage::config::CompressionCodec::Zstd
+        );
+        assert_eq!(resolved.engine_options.prefix_restart_interval, 32);
+        assert_eq!(resolved.engine_options.min_compress_size_bytes, 512);
+    }
+
     fn monotonic_nanos() -> u128 {
         match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => duration.as_nanos(),
             Err(err) => panic!("system clock should be after unix epoch: {err}"),
+        }
+    }
+
+    fn build_cli(runtime: RuntimeArgs) -> Cli {
+        Cli {
+            runtime,
+            command: Command::Flush {
+                db: PathBuf::from("/tmp/aether-cli-test"),
+            },
+        }
+    }
+
+    fn default_runtime_args() -> RuntimeArgs {
+        RuntimeArgs {
+            flush_on_shutdown: false,
+            final_metrics_json: false,
+            memtable_max_bytes: None,
+            sst_target_block_bytes: None,
+            l0_compaction_trigger: None,
+            enable_metrics_log_interval_ms: None,
+            fsync_policy: FsyncPolicyArg::Always,
+            fsync_interval_ms: None,
+            max_write_batch_ops: None,
+            max_write_batch_bytes: None,
+            compression_codec: None,
+            prefix_restart_interval: None,
+            min_compress_size_bytes: None,
         }
     }
 }

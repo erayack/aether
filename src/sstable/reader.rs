@@ -6,6 +6,7 @@ use std::{
 };
 
 use parking_lot::Mutex;
+use snap::raw::Decoder as SnappyDecoder;
 
 use crate::{
     error::Result,
@@ -13,8 +14,12 @@ use crate::{
 };
 
 use super::{
-    FOOTER_TRAILER_LEN, SST_MAGIC, SST_VERSION, SsTableMeta, block::find_in_block,
-    bloom::BloomFilter, decode_footer, decode_footer_trailer, decode_index_entries, invalid_data,
+    BlockEncodingKind, DATA_BLOCK_HEADER_LEN, FOOTER_TRAILER_LEN, FooterCompressionCodec,
+    SST_MAGIC, SST_VERSION, SsTableMeta,
+    block::{decode_block, find_in_block_dispatch},
+    bloom::BloomFilter,
+    decode_data_block_header, decode_footer, decode_footer_trailer, decode_index_entries,
+    invalid_data,
 };
 
 pub struct SsTableReader {
@@ -24,6 +29,8 @@ pub struct SsTableReader {
     meta: SsTableMeta,
     index: Vec<super::IndexEntry>,
     bloom: BloomFilter,
+    block_encoding: BlockEncodingKind,
+    compression_codec: FooterCompressionCodec,
 }
 
 pub struct SsTableRangeIter {
@@ -35,6 +42,8 @@ pub struct SsTableRangeIter {
     block_index_cursor: usize,
     in_block_entries: Vec<InternalEntry>,
     in_block_cursor: usize,
+    block_encoding: BlockEncodingKind,
+    compression_codec: FooterCompressionCodec,
 }
 
 const MAX_SECTION_BYTES: usize = 128 * 1024 * 1024;
@@ -64,31 +73,42 @@ impl SsTableReader {
             return Err(invalid_data("SSTable magic mismatch").into());
         }
         if version != SST_VERSION {
-            return Err(invalid_data("SSTable version mismatch").into());
+            return Err(invalid_data("SSTable version is not supported").into());
         }
 
         let footer = read_footer(&mut file, file_len, footer_len_u32)?;
 
-        if footer.entry_count == 0 {
+        if footer.entry_count() == 0 {
             return Err(invalid_data("SSTable footer entry count must be positive").into());
         }
-        if footer.min_key != meta.min_key
-            || footer.max_key != meta.max_key
-            || footer.max_seq != meta.max_seq
+        if footer.min_key() != &meta.min_key
+            || footer.max_key() != &meta.max_key
+            || footer.max_seq() != meta.max_seq
         {
             return Err(invalid_data("SSTable metadata does not match footer contents").into());
         }
 
-        let index_raw =
-            read_handle_payload(&mut file, file_len, footer.index.offset, footer.index.len)?;
+        let index_raw = read_handle_payload(
+            &mut file,
+            file_len,
+            footer.index_handle().offset,
+            footer.index_handle().len,
+        )?;
         let index = decode_index_entries(&index_raw)?;
         if index.is_empty() {
             return Err(invalid_data("SSTable index must contain at least one block").into());
         }
 
-        let bloom_raw =
-            read_handle_payload(&mut file, file_len, footer.bloom.offset, footer.bloom.len)?;
+        let bloom_raw = read_handle_payload(
+            &mut file,
+            file_len,
+            footer.bloom_handle().offset,
+            footer.bloom_handle().len,
+        )?;
         let bloom = BloomFilter::decode(&bloom_raw)?;
+        let metadata = footer.metadata();
+        let block_encoding = metadata.block_encoding_kind;
+        let compression_codec = metadata.default_compression_codec;
 
         Ok(Self {
             file_path: path.to_path_buf(),
@@ -97,6 +117,8 @@ impl SsTableReader {
             meta,
             index,
             bloom,
+            block_encoding,
+            compression_codec,
         })
     }
 
@@ -122,7 +144,7 @@ impl SsTableReader {
             return Err(invalid_data("SSTable magic mismatch").into());
         }
         if version != SST_VERSION {
-            return Err(invalid_data("SSTable version mismatch").into());
+            return Err(invalid_data("SSTable version is not supported").into());
         }
 
         let footer = read_footer(&mut file, file_len, footer_len_u32)?;
@@ -130,9 +152,9 @@ impl SsTableReader {
         Ok(SsTableMeta {
             table_id,
             level,
-            min_key: footer.min_key,
-            max_key: footer.max_key,
-            max_seq: footer.max_seq,
+            min_key: footer.min_key().clone(),
+            max_key: footer.max_key().clone(),
+            max_seq: footer.max_seq(),
         })
     }
 
@@ -157,9 +179,9 @@ impl SsTableReader {
         let handle = self.index[index_pos].handle;
         let block = {
             let mut file = self.file.lock();
-            read_handle_payload(&mut file, self.file_len, handle.offset, handle.len)?
+            read_data_block_payload(&mut file, self.file_len, handle, self.compression_codec)?
         };
-        find_in_block(&block, key)
+        find_in_block_dispatch(&block, key, self.block_encoding)
     }
 
     /// Reads and decodes all entries in this table in key order.
@@ -173,14 +195,14 @@ impl SsTableReader {
         for index_entry in &self.index {
             let block = {
                 let mut file = self.file.lock();
-                read_handle_payload(
+                read_data_block_payload(
                     &mut file,
                     self.file_len,
-                    index_entry.handle.offset,
-                    index_entry.handle.len,
+                    index_entry.handle,
+                    self.compression_codec,
                 )?
             };
-            let mut entries = super::block::decode_block_entries(&block)?;
+            let mut entries = decode_block(&block, self.block_encoding)?;
             all_entries.append(&mut entries);
         }
 
@@ -207,6 +229,8 @@ impl SsTableReader {
                 block_index_cursor: 0,
                 in_block_entries: Vec::new(),
                 in_block_cursor: 0,
+                block_encoding: self.block_encoding,
+                compression_codec: self.compression_codec,
             });
         }
 
@@ -225,7 +249,24 @@ impl SsTableReader {
             block_index_cursor: 0,
             in_block_entries: Vec::new(),
             in_block_cursor: 0,
+            block_encoding: self.block_encoding,
+            compression_codec: self.compression_codec,
         })
+    }
+
+    /// Creates an iterator over all entries in this table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the underlying table file handle cannot be cloned.
+    pub fn iter_all(&self) -> Result<SsTableRangeIter> {
+        self.iter_range(
+            &ScanBounds {
+                start: Bound::Unbounded,
+                end: Bound::Unbounded,
+            },
+            u64::MAX,
+        )
     }
 
     #[must_use]
@@ -261,9 +302,13 @@ impl SsTableRangeIter {
 
             let handle = self.block_handles[self.block_index_cursor];
             self.block_index_cursor = self.block_index_cursor.saturating_add(1);
-            let block =
-                read_handle_payload(&mut self.file, self.file_len, handle.offset, handle.len)?;
-            self.in_block_entries = super::block::decode_block_entries(&block)?;
+            let block = read_data_block_payload(
+                &mut self.file,
+                self.file_len,
+                handle,
+                self.compression_codec,
+            )?;
+            self.in_block_entries = decode_block(&block, self.block_encoding)?;
             self.in_block_cursor = 0;
         }
     }
@@ -399,4 +444,63 @@ fn read_handle_payload(file: &mut File, file_len: u64, offset: u64, len: u32) ->
     file.read_exact(&mut raw)?;
 
     Ok(raw)
+}
+
+fn read_data_block_payload(
+    file: &mut File,
+    file_len: u64,
+    handle: super::BlockHandle,
+    compression_codec: FooterCompressionCodec,
+) -> Result<Vec<u8>> {
+    let raw = read_handle_payload(file, file_len, handle.offset, handle.len)?;
+    decode_data_block_payload(&raw, compression_codec)
+}
+
+fn decode_data_block_payload(
+    raw_block: &[u8],
+    compression_codec: FooterCompressionCodec,
+) -> Result<Vec<u8>> {
+    if raw_block.len() < DATA_BLOCK_HEADER_LEN {
+        return Err(invalid_data("SSTable v2 block is smaller than header").into());
+    }
+    let (is_compressed, raw_len_u32, stored_len_u32) =
+        decode_data_block_header(&raw_block[..DATA_BLOCK_HEADER_LEN])?;
+    let stored_len = usize::try_from(stored_len_u32)
+        .map_err(|_| invalid_data("SSTable block stored length not supported on this platform"))?;
+    let raw_len = usize::try_from(raw_len_u32)
+        .map_err(|_| invalid_data("SSTable block raw length not supported on this platform"))?;
+    if raw_len > MAX_SECTION_BYTES {
+        return Err(invalid_data("SSTable block raw length exceeds safety limit").into());
+    }
+
+    let payload = raw_block
+        .get(DATA_BLOCK_HEADER_LEN..)
+        .ok_or_else(|| invalid_data("SSTable v2 block payload truncated"))?;
+    if payload.len() != stored_len {
+        return Err(invalid_data("SSTable v2 block length metadata mismatch").into());
+    }
+
+    if !is_compressed {
+        if raw_len != stored_len {
+            return Err(invalid_data("SSTable v2 raw block length metadata mismatch").into());
+        }
+        return Ok(payload.to_vec());
+    }
+
+    let decoded = match compression_codec {
+        FooterCompressionCodec::None => {
+            return Err(
+                invalid_data("SSTable v2 block is marked compressed with codec none").into(),
+            );
+        }
+        FooterCompressionCodec::Snappy => SnappyDecoder::new()
+            .decompress_vec(payload)
+            .map_err(|_| invalid_data("SSTable snappy block decompression failed"))?,
+        FooterCompressionCodec::Zstd => zstd::bulk::decompress(payload, raw_len)
+            .map_err(|_| invalid_data("SSTable zstd block decompression failed"))?,
+    };
+    if decoded.len() != raw_len {
+        return Err(invalid_data("SSTable v2 block decoded length mismatch").into());
+    }
+    Ok(decoded)
 }
