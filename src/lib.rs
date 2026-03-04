@@ -5,6 +5,7 @@ pub mod manifest;
 pub mod memtable;
 pub mod merge_iter;
 pub mod metrics;
+pub mod snapshot;
 pub mod types;
 mod write_batch;
 
@@ -16,4 +17,5 @@ pub mod wal;
 pub use config::EngineOptions;
 pub use engine::AetherEngine;
 pub use metrics::MetricsSnapshot;
+pub use snapshot::Snapshot;
 pub use types::KvStore;

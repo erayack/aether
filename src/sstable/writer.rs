@@ -408,7 +408,7 @@ mod tests {
             Err(err) => panic!("finish should work: {err}"),
         };
 
-        let reader = match SsTableReader::open(&path, meta) {
+        let reader = match SsTableReader::open(&path, meta, false) {
             Ok(reader) => reader,
             Err(err) => panic!("open should work: {err}"),
         };
@@ -464,7 +464,7 @@ mod tests {
             Err(err) => panic!("finish should work: {err}"),
         };
 
-        let reader = match SsTableReader::open(&path, meta) {
+        let reader = match SsTableReader::open(&path, meta, false) {
             Ok(reader) => reader,
             Err(err) => panic!("open should work: {err}"),
         };
@@ -518,7 +518,7 @@ mod tests {
             Err(err) => panic!("finish should work: {err}"),
         };
 
-        let reader = match SsTableReader::open(&path, meta) {
+        let reader = match SsTableReader::open(&path, meta, false) {
             Ok(reader) => reader,
             Err(err) => panic!("open should work: {err}"),
         };
@@ -572,7 +572,7 @@ mod tests {
             Err(err) => panic!("finish should work: {err}"),
         };
 
-        let reader = match SsTableReader::open(&path, meta) {
+        let reader = match SsTableReader::open(&path, meta, false) {
             Ok(reader) => reader,
             Err(err) => panic!("open should work: {err}"),
         };

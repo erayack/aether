@@ -38,6 +38,12 @@ pub struct EngineOptions {
     pub prefix_restart_interval: u16,
     #[serde(default = "default_min_compress_size_bytes")]
     pub min_compress_size_bytes: usize,
+    #[serde(default = "default_enable_mmap_reads")]
+    pub enable_mmap_reads: bool,
+    #[serde(default = "default_block_cache_capacity_bytes")]
+    pub block_cache_capacity_bytes: usize,
+    #[serde(default = "default_max_open_snapshots")]
+    pub max_open_snapshots: usize,
     #[serde(default)]
     pub enable_metrics_log_interval: Option<u64>,
 }
@@ -56,6 +62,9 @@ impl EngineOptions {
             compression_codec: CompressionCodec::default(),
             prefix_restart_interval: default_prefix_restart_interval(),
             min_compress_size_bytes: default_min_compress_size_bytes(),
+            enable_mmap_reads: default_enable_mmap_reads(),
+            block_cache_capacity_bytes: default_block_cache_capacity_bytes(),
+            max_open_snapshots: default_max_open_snapshots(),
             enable_metrics_log_interval: None,
         }
     }
@@ -86,5 +95,17 @@ const fn default_prefix_restart_interval() -> u16 {
 }
 
 const fn default_min_compress_size_bytes() -> usize {
+    1024
+}
+
+const fn default_enable_mmap_reads() -> bool {
+    false
+}
+
+const fn default_block_cache_capacity_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
+const fn default_max_open_snapshots() -> usize {
     1024
 }

@@ -43,6 +43,12 @@ struct RuntimeArgs {
     max_write_batch_ops: Option<usize>,
     #[arg(long, global = true)]
     max_write_batch_bytes: Option<usize>,
+    #[arg(long, default_value_t = false, global = true)]
+    enable_mmap_reads: bool,
+    #[arg(long, global = true)]
+    block_cache_capacity_bytes: Option<usize>,
+    #[arg(long, global = true)]
+    max_open_snapshots: Option<usize>,
     #[arg(long, value_enum, global = true)]
     compression_codec: Option<CompressionCodecArg>,
     #[arg(
@@ -208,6 +214,16 @@ fn resolve_config(cli: &Cli) -> Result<ResolvedRuntimeConfig> {
     }
     if let Some(max_bytes) = cli.runtime.max_write_batch_bytes {
         engine_options.max_write_batch_bytes = max_bytes;
+    }
+    engine_options.enable_mmap_reads = cli.runtime.enable_mmap_reads;
+    if let Some(capacity_bytes) = cli.runtime.block_cache_capacity_bytes {
+        engine_options.block_cache_capacity_bytes = capacity_bytes;
+    }
+    if let Some(max_open_snapshots) = cli.runtime.max_open_snapshots {
+        if max_open_snapshots == 0 {
+            bail!("--max-open-snapshots must be > 0");
+        }
+        engine_options.max_open_snapshots = max_open_snapshots;
     }
     if let Some(codec) = cli.runtime.compression_codec {
         engine_options.compression_codec = codec.into();
@@ -814,6 +830,19 @@ mod tests {
         assert_eq!(resolved.engine_options.min_compress_size_bytes, 512);
     }
 
+    #[test]
+    fn resolve_config_rejects_zero_max_open_snapshots() {
+        let cli = build_cli(RuntimeArgs {
+            max_open_snapshots: Some(0),
+            ..default_runtime_args()
+        });
+        let result = resolve_config(&cli);
+        assert!(
+            result.is_err(),
+            "zero max-open-snapshots should be rejected"
+        );
+    }
+
     fn monotonic_nanos() -> u128 {
         match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
             Ok(duration) => duration.as_nanos(),
@@ -842,6 +871,9 @@ mod tests {
             fsync_interval_ms: None,
             max_write_batch_ops: None,
             max_write_batch_bytes: None,
+            enable_mmap_reads: false,
+            block_cache_capacity_bytes: None,
+            max_open_snapshots: None,
             compression_codec: None,
             prefix_restart_interval: None,
             min_compress_size_bytes: None,

@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     mem::size_of,
     path::{Path, PathBuf},
@@ -23,6 +23,7 @@ use crate::{
     memtable::{MemTable, MemTableSet},
     merge_iter::{MergeIterator, MergeMode, SourceCursor},
     metrics::{MetricsHandle, MetricsSnapshot},
+    snapshot::Snapshot,
     sstable::{
         BlockEncodingKind, FooterMetadata, SsTableMeta, reader::SsTableReader,
         writer::SsTableWriter,
@@ -52,14 +53,18 @@ struct Inner {
     memtable_max_bytes: usize,
     sst_target_block_bytes: usize,
     l0_compaction_trigger: usize,
+    max_open_snapshots: usize,
     max_write_batch_ops: usize,
     max_write_batch_bytes: usize,
     compression_codec: CompressionCodec,
     prefix_restart_interval: u16,
     min_compress_size_bytes: usize,
+    enable_mmap_reads: bool,
     metrics_log_interval: Option<Duration>,
     last_metrics_log_at: Mutex<Option<Instant>>,
     background_error: Mutex<Option<String>>,
+    snapshot_registry: Mutex<SnapshotRegistry>,
+    obsolete_table_files: Mutex<Vec<ObsoleteTableFile>>,
 }
 
 struct WriteState {
@@ -85,6 +90,14 @@ struct TableHandle {
     reader: Arc<SsTableReader>,
 }
 
+pub(crate) struct PinnedReadState {
+    visible_seq: u64,
+    mutable_entries: Vec<InternalEntry>,
+    immutable_entries: Vec<InternalEntry>,
+    l0_tables: Vec<TableSource>,
+    l1_tables: Vec<TableSource>,
+}
+
 struct ReadSnapshot {
     visible_seq: u64,
     mutable_entries: Vec<InternalEntry>,
@@ -93,9 +106,49 @@ struct ReadSnapshot {
     l1_tables: Vec<TableSource>,
 }
 
-struct TableSource {
+pub(crate) struct TableSource {
     reader: Arc<SsTableReader>,
     source_rank: u32,
+}
+
+#[derive(Default)]
+struct SnapshotRegistry {
+    next_id: u64,
+    active: HashMap<u64, SnapshotMeta>,
+}
+
+struct SnapshotMeta {
+    visible_seq: u64,
+}
+
+struct ObsoleteTableFile {
+    table_id: u64,
+    level: u8,
+    path: PathBuf,
+    max_seq: u64,
+}
+
+pub(crate) struct SnapshotHandle {
+    snapshot_id: u64,
+    engine: std::sync::Weak<Inner>,
+}
+
+impl PinnedReadState {
+    pub(crate) const fn visible_seq(&self) -> u64 {
+        self.visible_seq
+    }
+}
+
+impl Drop for SnapshotHandle {
+    fn drop(&mut self) {
+        let Some(inner) = self.engine.upgrade() else {
+            return;
+        };
+
+        let engine = AetherEngine { inner };
+        engine.unregister_snapshot(self.snapshot_id);
+        engine.try_cleanup_obsolete_tables();
+    }
 }
 
 struct CompactionSelection {
@@ -111,6 +164,7 @@ struct SstableWriteSettings {
     compression_codec: CompressionCodec,
     prefix_restart_interval: u16,
     min_compress_size_bytes: usize,
+    enable_mmap_reads: bool,
 }
 
 struct BackgroundTaskChannels {
@@ -125,6 +179,10 @@ impl AetherEngine {
     ///
     /// Returns an error if the database cannot be initialized.
     pub fn open(opts: EngineOptions) -> Result<Self> {
+        if opts.max_open_snapshots == 0 {
+            return Err(invalid_input("max_open_snapshots must be > 0").into());
+        }
+
         fs::create_dir_all(&opts.db_dir)?;
 
         let mut manifest = ManifestStore::load_or_create(&opts.db_dir)?;
@@ -142,7 +200,7 @@ impl AetherEngine {
         }
 
         let loaded_tables = if manifest.levels.is_empty() {
-            let discovered = discover_sstables(&opts.db_dir)?;
+            let discovered = discover_sstables(&opts.db_dir, opts.enable_mmap_reads)?;
             if discovered.is_empty() {
                 Vec::new()
             } else {
@@ -155,7 +213,7 @@ impl AetherEngine {
                 discovered
             }
         } else {
-            load_sstables_from_manifest(&opts.db_dir, &manifest)?
+            load_sstables_from_manifest(&opts.db_dir, &manifest, opts.enable_mmap_reads)?
         };
 
         let next_table_id = max_table_id(&manifest.levels)
@@ -188,17 +246,21 @@ impl AetherEngine {
                 memtable_max_bytes: opts.memtable_max_bytes,
                 sst_target_block_bytes: opts.sst_target_block_bytes,
                 l0_compaction_trigger: opts.l0_compaction_trigger,
+                max_open_snapshots: opts.max_open_snapshots,
                 max_write_batch_ops: opts.max_write_batch_ops,
                 max_write_batch_bytes: opts.max_write_batch_bytes,
                 compression_codec: opts.compression_codec,
                 prefix_restart_interval: opts.prefix_restart_interval,
                 min_compress_size_bytes: opts.min_compress_size_bytes,
+                enable_mmap_reads: opts.enable_mmap_reads,
                 metrics_log_interval: opts
                     .enable_metrics_log_interval
                     .filter(|millis| *millis > 0)
                     .map(Duration::from_millis),
                 last_metrics_log_at: Mutex::new(None),
                 background_error: Mutex::new(None),
+                snapshot_registry: Mutex::new(SnapshotRegistry::default()),
+                obsolete_table_files: Mutex::new(Vec::new()),
             }),
         };
 
@@ -217,6 +279,8 @@ impl AetherEngine {
             };
             Self { inner }.handle_compaction_job(job)
         });
+
+        engine.try_cleanup_obsolete_tables();
 
         Ok(engine)
     }
@@ -275,17 +339,96 @@ impl AetherEngine {
         <Self as KvStore>::write_batch(self, batch)
     }
 
+    /// Opens a read-only snapshot pinned to the current visible sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if background workers are unhealthy.
+    pub fn open_snapshot(&self) -> Result<Snapshot> {
+        self.ensure_background_workers_healthy()?;
+        let visible_seq = self.current_visible_sequence_number();
+        let handle = Arc::new(self.register_snapshot(visible_seq)?);
+        let pinned = match self.build_pinned_read_state(visible_seq) {
+            Ok(state) => Arc::new(state),
+            Err(err) => {
+                drop(handle);
+                return Err(err);
+            }
+        };
+        Ok(Snapshot::new(self.clone(), pinned, handle))
+    }
+
     #[must_use]
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
         self.inner.metrics.snapshot()
     }
 
-    fn build_read_snapshot(&self, options: &ScanOptions) -> Result<ReadSnapshot> {
+    fn current_visible_sequence_number(&self) -> u64 {
         let read_state = self.inner.read_state.read();
-        let visible_seq = read_state
+        read_state
             .manifest_snapshot
             .next_sequence_number
-            .saturating_sub(1);
+            .saturating_sub(1)
+    }
+
+    fn build_pinned_read_state(&self, visible_seq: u64) -> Result<PinnedReadState> {
+        use std::ops::Bound;
+
+        let read_state = self.inner.read_state.read();
+        let all_bounds = ScanBounds {
+            start: Bound::Unbounded,
+            end: Bound::Unbounded,
+        };
+        let mutable_entries = read_state
+            .memtables
+            .mutable()
+            .range_entries(&all_bounds, visible_seq);
+        let immutable_entries = read_state
+            .memtables
+            .immutable()
+            .map_or_else(Vec::new, |memtable| {
+                memtable.range_entries(&all_bounds, visible_seq)
+            });
+
+        let mut l0_tables = Vec::with_capacity(read_state.table_cache.l0.len());
+        for (index, table) in read_state.table_cache.l0.iter().enumerate() {
+            let offset = u32::try_from(index)
+                .map_err(|_| invalid_data("L0 table count exceeds source-rank range"))?;
+            let source_rank = SOURCE_RANK_L0_BASE
+                .checked_add(offset)
+                .ok_or_else(|| invalid_data("L0 source-rank overflow"))?;
+            l0_tables.push(TableSource {
+                reader: Arc::clone(&table.reader),
+                source_rank,
+            });
+        }
+
+        let mut l1_tables = Vec::with_capacity(read_state.table_cache.l1.len());
+        for (index, table) in read_state.table_cache.l1.iter().enumerate() {
+            let offset = u32::try_from(index)
+                .map_err(|_| invalid_data("L1 table count exceeds source-rank range"))?;
+            let source_rank = SOURCE_RANK_L1_BASE
+                .checked_add(offset)
+                .ok_or_else(|| invalid_data("L1 source-rank overflow"))?;
+            l1_tables.push(TableSource {
+                reader: Arc::clone(&table.reader),
+                source_rank,
+            });
+        }
+
+        drop(read_state);
+
+        Ok(PinnedReadState {
+            visible_seq,
+            mutable_entries,
+            immutable_entries,
+            l0_tables,
+            l1_tables,
+        })
+    }
+
+    fn build_read_snapshot(&self, options: &ScanOptions, visible_seq: u64) -> Result<ReadSnapshot> {
+        let read_state = self.inner.read_state.read();
         let mutable_entries = read_state
             .memtables
             .mutable()
@@ -342,6 +485,125 @@ impl AetherEngine {
             l0_tables,
             l1_tables,
         })
+    }
+
+    pub(crate) fn scan_at_sequence(
+        &self,
+        options: ScanOptions,
+        visible_seq: u64,
+    ) -> Result<Vec<ScanItem>> {
+        let ScanOptions { bounds, limit } = options;
+
+        if has_invalid_scan_bounds(&bounds) {
+            return Err(invalid_input("scan start bound is greater than end bound").into());
+        }
+
+        if matches!(limit, Some(0)) {
+            return Ok(Vec::new());
+        }
+
+        let options = ScanOptions { bounds, limit };
+        let snapshot = self.build_read_snapshot(&options, visible_seq)?;
+        let mut sources = vec![
+            SourceCursor::from_entries(snapshot.mutable_entries, 0),
+            SourceCursor::from_entries(snapshot.immutable_entries, 1),
+        ];
+
+        for source in snapshot.l0_tables {
+            let TableSource {
+                reader,
+                source_rank,
+                ..
+            } = source;
+            let iter = reader.iter_range(&options.bounds, snapshot.visible_seq)?;
+            sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
+        }
+
+        for source in snapshot.l1_tables {
+            let TableSource {
+                reader,
+                source_rank,
+                ..
+            } = source;
+            let iter = reader.iter_range(&options.bounds, snapshot.visible_seq)?;
+            sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
+        }
+
+        let limit = options.limit.unwrap_or(usize::MAX);
+        let mut output = Vec::new();
+        let mut merge_iter = MergeIterator::new(MergeMode::UserScan, sources);
+        while output.len() < limit {
+            let Some(entry) = merge_iter.next_entry()? else {
+                break;
+            };
+
+            if let ValueEntry::Put(value) = entry.value {
+                output.push(ScanItem {
+                    key: entry.key,
+                    value,
+                });
+            }
+        }
+
+        Ok(output)
+    }
+
+    pub(crate) fn scan_pinned(
+        &self,
+        options: ScanOptions,
+        pinned: &PinnedReadState,
+    ) -> Result<Vec<ScanItem>> {
+        self.ensure_background_workers_healthy()?;
+        let ScanOptions { bounds, limit } = options;
+
+        if has_invalid_scan_bounds(&bounds) {
+            return Err(invalid_input("scan start bound is greater than end bound").into());
+        }
+
+        if matches!(limit, Some(0)) {
+            return Ok(Vec::new());
+        }
+
+        let options = ScanOptions { bounds, limit };
+        let mutable_entries = filter_entries_by_bounds(&pinned.mutable_entries, &options.bounds);
+        let immutable_entries =
+            filter_entries_by_bounds(&pinned.immutable_entries, &options.bounds);
+        let mut sources = vec![
+            SourceCursor::from_entries(mutable_entries, 0),
+            SourceCursor::from_entries(immutable_entries, 1),
+        ];
+
+        for source in &pinned.l0_tables {
+            let iter = source
+                .reader
+                .iter_range(&options.bounds, pinned.visible_seq)?;
+            sources.push(SourceCursor::from_sstable_iter(iter, source.source_rank));
+        }
+
+        for source in &pinned.l1_tables {
+            let iter = source
+                .reader
+                .iter_range(&options.bounds, pinned.visible_seq)?;
+            sources.push(SourceCursor::from_sstable_iter(iter, source.source_rank));
+        }
+
+        let limit = options.limit.unwrap_or(usize::MAX);
+        let mut output = Vec::new();
+        let mut merge_iter = MergeIterator::new(MergeMode::UserScan, sources);
+        while output.len() < limit {
+            let Some(entry) = merge_iter.next_entry()? else {
+                break;
+            };
+
+            if let ValueEntry::Put(value) = entry.value {
+                output.push(ScanItem {
+                    key: entry.key,
+                    value,
+                });
+            }
+        }
+
+        Ok(output)
     }
 
     fn apply_write(&self, key: Key, value: ValueEntry) -> Result<()> {
@@ -520,10 +782,7 @@ impl AetherEngine {
                 &db_dir,
                 job.memtable,
                 table_id,
-                self.inner.sst_target_block_bytes,
-                self.inner.compression_codec,
-                self.inner.prefix_restart_interval,
-                self.inner.min_compress_size_bytes,
+                sstable_write_settings(&self.inner),
             )?;
             let output_table_bytes =
                 table_file_size_bytes(&db_dir, table.meta.table_id, table.meta.level)?;
@@ -651,22 +910,22 @@ impl AetherEngine {
         }
         read_state.manifest_snapshot = write_state.manifest.clone();
 
-        let removed_paths = selection
+        let obsolete_files: Vec<ObsoleteTableFile> = selection
             .selected_l0
             .iter()
             .chain(selection.selected_l1.iter())
-            .map(|meta| sstable_path(&write_state.db_dir, meta.table_id, meta.level))
-            .collect::<Vec<_>>();
+            .map(|meta| ObsoleteTableFile {
+                table_id: meta.table_id,
+                level: meta.level,
+                path: sstable_path(&write_state.db_dir, meta.table_id, meta.level),
+                max_seq: meta.max_seq,
+            })
+            .collect();
         drop(read_state);
         drop(write_state);
 
-        for path in removed_paths {
-            match fs::remove_file(path) {
-                Ok(()) => {}
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                Err(err) => return Err(err.into()),
-            }
-        }
+        self.enqueue_obsolete_tables(obsolete_files);
+        self.try_cleanup_obsolete_tables();
 
         self.inner
             .metrics
@@ -729,6 +988,80 @@ impl AetherEngine {
             return Err(std::io::Error::other(message).into());
         }
         Ok(())
+    }
+
+    fn register_snapshot(&self, visible_seq: u64) -> Result<SnapshotHandle> {
+        let mut registry = self.inner.snapshot_registry.lock();
+
+        if registry.active.len() >= self.inner.max_open_snapshots {
+            return Err(invalid_input("max_open_snapshots exceeded").into());
+        }
+
+        let snapshot_id = registry.next_id;
+        registry.next_id = registry
+            .next_id
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("snapshot id overflow"))?;
+        registry
+            .active
+            .insert(snapshot_id, SnapshotMeta { visible_seq });
+        drop(registry);
+
+        Ok(SnapshotHandle {
+            snapshot_id,
+            engine: Arc::downgrade(&self.inner),
+        })
+    }
+
+    fn unregister_snapshot(&self, snapshot_id: u64) {
+        let mut registry = self.inner.snapshot_registry.lock();
+        let _ = registry.active.remove(&snapshot_id);
+    }
+
+    fn enqueue_obsolete_tables(&self, files: Vec<ObsoleteTableFile>) {
+        let mut queue = self.inner.obsolete_table_files.lock();
+        queue.extend(files);
+    }
+
+    fn oldest_active_snapshot_seq(&self) -> Option<u64> {
+        let registry = self.inner.snapshot_registry.lock();
+        registry.active.values().map(|meta| meta.visible_seq).min()
+    }
+
+    fn try_cleanup_obsolete_tables(&self) {
+        let oldest_snapshot_seq = self.oldest_active_snapshot_seq();
+
+        let to_delete = {
+            let mut queue = self.inner.obsolete_table_files.lock();
+            let (deletable, keep): (Vec<_>, Vec<_>) = queue
+                .drain(..)
+                .partition(|file| oldest_snapshot_seq.is_none_or(|oldest| file.max_seq <= oldest));
+            *queue = keep;
+            deletable
+        };
+
+        let mut failed_deletes = Vec::new();
+        for file in to_delete {
+            match fs::remove_file(&file.path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    error!(
+                        event = "deferred_delete.error",
+                        table_id = file.table_id,
+                        level = file.level,
+                        error = %err,
+                        "failed to delete obsolete SST file"
+                    );
+                    failed_deletes.push(file);
+                }
+            }
+        }
+
+        if !failed_deletes.is_empty() {
+            let mut queue = self.inner.obsolete_table_files.lock();
+            queue.extend(failed_deletes);
+        }
     }
 }
 
@@ -845,58 +1178,7 @@ impl KvStore for AetherEngine {
 
     fn scan(&self, options: ScanOptions) -> Result<Vec<ScanItem>> {
         self.ensure_background_workers_healthy()?;
-
-        if has_invalid_scan_bounds(&options.bounds) {
-            return Err(invalid_input("scan start bound is greater than end bound").into());
-        }
-
-        if matches!(options.limit, Some(0)) {
-            return Ok(Vec::new());
-        }
-
-        let snapshot = self.build_read_snapshot(&options)?;
-        let mut sources = vec![
-            SourceCursor::from_entries(snapshot.mutable_entries, 0),
-            SourceCursor::from_entries(snapshot.immutable_entries, 1),
-        ];
-
-        for source in snapshot.l0_tables {
-            let TableSource {
-                reader,
-                source_rank,
-                ..
-            } = source;
-            let iter = reader.iter_range(&options.bounds, snapshot.visible_seq)?;
-            sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
-        }
-
-        for source in snapshot.l1_tables {
-            let TableSource {
-                reader,
-                source_rank,
-                ..
-            } = source;
-            let iter = reader.iter_range(&options.bounds, snapshot.visible_seq)?;
-            sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
-        }
-
-        let limit = options.limit.unwrap_or(usize::MAX);
-        let mut output = Vec::new();
-        let mut merge_iter = MergeIterator::new(MergeMode::UserScan, sources);
-        while output.len() < limit {
-            let Some(entry) = merge_iter.next_entry()? else {
-                break;
-            };
-
-            if let ValueEntry::Put(value) = entry.value {
-                output.push(ScanItem {
-                    key: entry.key,
-                    value,
-                });
-            }
-        }
-
-        Ok(output)
+        self.scan_at_sequence(options, self.current_visible_sequence_number())
     }
 
     fn write_batch(&self, batch: WriteBatch) -> Result<()> {
@@ -1127,7 +1409,7 @@ fn table_key_ranges_overlap(meta: &SsTableMeta, min_key: &[u8], max_key: &[u8]) 
     !(meta.max_key.as_ref() < min_key || meta.min_key.as_ref() > max_key)
 }
 
-fn discover_sstables(db_dir: &Path) -> Result<Vec<TableHandle>> {
+fn discover_sstables(db_dir: &Path, enable_mmap_reads: bool) -> Result<Vec<TableHandle>> {
     let mut discovered = Vec::new();
     for entry in fs::read_dir(db_dir)? {
         let entry = entry?;
@@ -1146,7 +1428,7 @@ fn discover_sstables(db_dir: &Path) -> Result<Vec<TableHandle>> {
 
         let path = entry.path();
         let meta = SsTableReader::load_meta(&path, table_id, level)?;
-        let reader = SsTableReader::open(&path, meta.clone())?;
+        let reader = SsTableReader::open(&path, meta.clone(), enable_mmap_reads)?;
         discovered.push(TableHandle {
             meta,
             reader: Arc::new(reader),
@@ -1159,12 +1441,13 @@ fn discover_sstables(db_dir: &Path) -> Result<Vec<TableHandle>> {
 fn load_sstables_from_manifest(
     db_dir: &Path,
     manifest: &ManifestState,
+    enable_mmap_reads: bool,
 ) -> Result<Vec<TableHandle>> {
     let mut loaded = Vec::new();
     for level in &manifest.levels {
         for meta in level {
             let path = sstable_path(db_dir, meta.table_id, meta.level);
-            let reader = SsTableReader::open(&path, meta.clone())?;
+            let reader = SsTableReader::open(&path, meta.clone(), enable_mmap_reads)?;
             loaded.push(TableHandle {
                 meta: meta.clone(),
                 reader: Arc::new(reader),
@@ -1199,6 +1482,33 @@ fn table_overlaps_bounds(meta: &SsTableMeta, bounds: &ScanBounds) -> bool {
     };
 
     above_start && below_end
+}
+
+fn filter_entries_by_bounds(entries: &[InternalEntry], bounds: &ScanBounds) -> Vec<InternalEntry> {
+    entries
+        .iter()
+        .filter(|entry| key_within_bounds(entry.key.as_ref(), bounds))
+        .cloned()
+        .collect()
+}
+
+fn key_within_bounds(key: &[u8], bounds: &ScanBounds) -> bool {
+    use std::ops::Bound;
+
+    let above_start = match &bounds.start {
+        Bound::Included(start) => key >= start.as_ref(),
+        Bound::Excluded(start) => key > start.as_ref(),
+        Bound::Unbounded => true,
+    };
+    if !above_start {
+        return false;
+    }
+
+    match &bounds.end {
+        Bound::Included(end) => key <= end.as_ref(),
+        Bound::Excluded(end) => key < end.as_ref(),
+        Bound::Unbounded => true,
+    }
 }
 
 fn has_invalid_scan_bounds(bounds: &ScanBounds) -> bool {
@@ -1237,6 +1547,7 @@ const fn sstable_write_settings(inner: &Inner) -> SstableWriteSettings {
         compression_codec: inner.compression_codec,
         prefix_restart_interval: inner.prefix_restart_interval,
         min_compress_size_bytes: inner.min_compress_size_bytes,
+        enable_mmap_reads: inner.enable_mmap_reads,
     }
 }
 
@@ -1244,28 +1555,14 @@ fn flush_memtable_to_sstable(
     db_dir: &Path,
     mutable: MemTable,
     table_id: u64,
-    block_target_bytes: usize,
-    compression_codec: CompressionCodec,
-    prefix_restart_interval: u16,
-    min_compress_size_bytes: usize,
+    settings: SstableWriteSettings,
 ) -> Result<TableHandle> {
     let entries = mutable.into_sorted_entries();
     if entries.is_empty() {
         return Err(invalid_data("cannot flush empty memtable").into());
     }
 
-    write_entries_to_sstable(
-        db_dir,
-        &entries,
-        table_id,
-        0,
-        SstableWriteSettings {
-            block_target_bytes,
-            compression_codec,
-            prefix_restart_interval,
-            min_compress_size_bytes,
-        },
-    )
+    write_entries_to_sstable(db_dir, &entries, table_id, 0, settings)
 }
 
 fn write_entries_to_sstable(
@@ -1296,7 +1593,7 @@ fn write_entries_to_sstable(
         writer.add_entry(entry)?;
     }
     let meta = writer.finish()?;
-    let reader = SsTableReader::open(&path, meta.clone())?;
+    let reader = SsTableReader::open(&path, meta.clone(), settings.enable_mmap_reads)?;
 
     Ok(TableHandle {
         meta,
@@ -1404,12 +1701,12 @@ mod tests {
     use std::{
         fs,
         ops::Bound,
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
     use bytes::Bytes;
 
-    use super::AetherEngine;
+    use super::{AetherEngine, sstable_path};
     use crate::{
         config::EngineOptions,
         types::{BatchOp, ScanBounds, ScanOptions, WriteBatch},
@@ -1421,6 +1718,50 @@ mod tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         std::env::temp_dir().join(format!("aether-{prefix}-{nanos}"))
+    }
+
+    fn wait_until<F>(timeout: Duration, mut predicate: F) -> bool
+    where
+        F: FnMut() -> bool,
+    {
+        let started = Instant::now();
+        while started.elapsed() < timeout {
+            if predicate() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        predicate()
+    }
+
+    fn wait_for_path_exists(path: &std::path::Path) -> bool {
+        wait_until(Duration::from_secs(2), || path.exists())
+    }
+
+    fn wait_for_path_missing(path: &std::path::Path) -> bool {
+        wait_until(Duration::from_secs(2), || !path.exists())
+    }
+
+    fn assert_loaded_tables_use_mmap(engine: &AetherEngine) {
+        let read_state = engine.inner.read_state.read();
+        let loaded_tables = read_state.table_cache.l0.len() + read_state.table_cache.l1.len();
+        assert!(
+            loaded_tables > 0,
+            "expected at least one loaded SSTable for mmap assertion"
+        );
+        for table in read_state
+            .table_cache
+            .l0
+            .iter()
+            .chain(read_state.table_cache.l1.iter())
+        {
+            assert!(
+                table.reader.is_mmap_backend(),
+                "expected table {} at L{} to use mmap backend",
+                table.meta.table_id,
+                table.meta.level
+            );
+        }
     }
 
     #[test]
@@ -1967,7 +2308,7 @@ mod tests {
             }
 
             // Allow background compaction to settle before drop.
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(200));
         }
 
         // Reopen to get a deterministic view after compaction (L1).
@@ -2035,7 +2376,7 @@ mod tests {
                 panic!("flush should succeed: {err}");
             }
 
-            std::thread::sleep(std::time::Duration::from_millis(200));
+            std::thread::sleep(Duration::from_millis(200));
         }
 
         // Phase 2: reopen, add L0 + mutable layers.
@@ -2078,6 +2419,638 @@ mod tests {
             "mutable memtable value should win over L0 and L1"
         );
         assert_eq!(get_value, Some(Bytes::from_static(b"v4")));
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn open_snapshot_enforces_max_open_snapshots() {
+        let db_dir = temp_db_dir("snapshot-cap");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.max_open_snapshots = 1;
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        let snapshot = match engine.open_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => panic!("first open_snapshot should succeed: {err}"),
+        };
+
+        let second = engine.open_snapshot();
+        assert!(
+            second.is_err(),
+            "second open_snapshot should fail when cap is reached"
+        );
+
+        drop(snapshot);
+
+        let reopened = engine.open_snapshot();
+        assert!(
+            reopened.is_ok(),
+            "open_snapshot should succeed after previous snapshot drops"
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn snapshot_clone_keeps_registry_slot_until_last_drop() {
+        let db_dir = temp_db_dir("snapshot-clone-lifecycle");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.max_open_snapshots = 1;
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        let snapshot = match engine.open_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => panic!("open_snapshot should succeed: {err}"),
+        };
+        let snapshot_clone = snapshot.clone();
+
+        drop(snapshot);
+
+        let still_blocked = engine.open_snapshot();
+        assert!(
+            still_blocked.is_err(),
+            "snapshot clone should keep registry slot active"
+        );
+
+        drop(snapshot_clone);
+
+        let now_open = engine.open_snapshot();
+        assert!(
+            now_open.is_ok(),
+            "open_snapshot should succeed after last clone drops"
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_obsolete_files_while_snapshot_is_open() {
+        let db_dir = temp_db_dir("deferred-delete-open-snapshot");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.l0_compaction_trigger = 2;
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+
+        let snapshot = match engine.open_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => panic!("open_snapshot should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+
+        let l0_t0 = sstable_path(&db_dir, 0, 0);
+        let l0_t1 = sstable_path(&db_dir, 1, 0);
+        let l1_t2 = sstable_path(&db_dir, 2, 1);
+
+        assert!(
+            wait_for_path_exists(&l1_t2),
+            "compaction output should appear"
+        );
+        assert!(
+            l0_t1.exists(),
+            "newer obsolete file should be retained while snapshot is open"
+        );
+
+        drop(snapshot);
+
+        assert!(
+            wait_for_path_missing(&l0_t0),
+            "older obsolete file should be eventually removed after snapshot release"
+        );
+        assert!(
+            wait_for_path_missing(&l0_t1),
+            "newer obsolete file should be removed after snapshot release"
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn compaction_without_snapshots_deletes_obsolete_files() {
+        let db_dir = temp_db_dir("deferred-delete-no-snapshot");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.l0_compaction_trigger = 2;
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+        if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+
+        let l0_t0 = sstable_path(&db_dir, 0, 0);
+        let l0_t1 = sstable_path(&db_dir, 1, 0);
+        let l1_t2 = sstable_path(&db_dir, 2, 1);
+
+        assert!(
+            wait_for_path_exists(&l1_t2),
+            "compaction output should appear"
+        );
+        assert!(
+            wait_for_path_missing(&l0_t0),
+            "obsolete L0 table 0 should be deleted without snapshots"
+        );
+        assert!(
+            wait_for_path_missing(&l0_t1),
+            "obsolete L0 table 1 should be deleted without snapshots"
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn oldest_snapshot_controls_deferred_cleanup_threshold() {
+        let db_dir = temp_db_dir("deferred-delete-multi-snapshot");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.l0_compaction_trigger = 3;
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"v0")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+        let older_snapshot = match engine.open_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => panic!("older open_snapshot should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"v1")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+        let newer_snapshot = match engine.open_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => panic!("newer open_snapshot should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"v2")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+
+        let l0_t0 = sstable_path(&db_dir, 0, 0);
+        let l0_t1 = sstable_path(&db_dir, 1, 0);
+        let l0_t2 = sstable_path(&db_dir, 2, 0);
+        let l1_t3 = sstable_path(&db_dir, 3, 1);
+
+        assert!(
+            wait_for_path_exists(&l1_t3),
+            "compaction output should appear"
+        );
+        assert!(
+            l0_t2.exists(),
+            "highest-seq obsolete file should remain while oldest snapshot is still open"
+        );
+
+        drop(older_snapshot);
+        assert!(
+            wait_for_path_missing(&l0_t1),
+            "middle obsolete file should become deletable after oldest snapshot drops"
+        );
+        assert!(
+            l0_t2.exists(),
+            "newest obsolete file should still be retained while newer snapshot is open"
+        );
+
+        drop(newer_snapshot);
+        assert!(
+            wait_for_path_missing(&l0_t0),
+            "oldest obsolete file should be gone after final snapshot drop"
+        );
+        assert!(
+            wait_for_path_missing(&l0_t2),
+            "newest obsolete file should be removed after final snapshot drop"
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn deferred_cleanup_waits_for_last_snapshot_clone() {
+        let db_dir = temp_db_dir("deferred-delete-clone");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.l0_compaction_trigger = 2;
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+
+        let snapshot = match engine.open_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(err) => panic!("open_snapshot should succeed: {err}"),
+        };
+        let snapshot_clone = snapshot.clone();
+
+        if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+
+        let l0_t1 = sstable_path(&db_dir, 1, 0);
+        let l1_t2 = sstable_path(&db_dir, 2, 1);
+        assert!(
+            wait_for_path_exists(&l1_t2),
+            "compaction output should appear"
+        );
+        assert!(
+            l0_t1.exists(),
+            "obsolete file should be retained while snapshot clones are alive"
+        );
+
+        drop(snapshot);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            l0_t1.exists(),
+            "dropping one clone must not release deferred cleanup"
+        );
+
+        drop(snapshot_clone);
+        assert!(
+            wait_for_path_missing(&l0_t1),
+            "obsolete file should be removed after last clone drops"
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn mmap_get_after_flush_returns_value() {
+        let db_dir = temp_db_dir("mmap-get-flush");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.enable_mmap_reads = true;
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"v")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+        assert_loaded_tables_use_mmap(&engine);
+
+        let value = match engine.get(b"k") {
+            Ok(value) => value,
+            Err(err) => panic!("get should succeed: {err}"),
+        };
+        assert_eq!(value, Some(Bytes::from_static(b"v")));
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn mmap_scan_after_flush_returns_ordered_entries() {
+        let db_dir = temp_db_dir("mmap-scan-flush");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.enable_mmap_reads = true;
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+
+        for (key, value) in [
+            (b"a", b"1"),
+            (b"b", b"2"),
+            (b"c", b"3"),
+            (b"d", b"4"),
+            (b"e", b"5"),
+        ] {
+            if let Err(err) = engine.put(Bytes::copy_from_slice(key), Bytes::copy_from_slice(value))
+            {
+                panic!("put should succeed: {err}");
+            }
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+        assert_loaded_tables_use_mmap(&engine);
+
+        let items = match engine.scan(unbounded_scan()) {
+            Ok(items) => items,
+            Err(err) => panic!("scan should succeed: {err}"),
+        };
+        assert_eq!(
+            scan_kv(&items),
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+                (b"e".to_vec(), b"5".to_vec()),
+            ]
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn mmap_get_after_compaction_reads_l1() {
+        let db_dir = temp_db_dir("mmap-get-compaction");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.enable_mmap_reads = true;
+        opts.l0_compaction_trigger = 2;
+
+        {
+            let engine = match AetherEngine::open(opts.clone()) {
+                Ok(engine) => engine,
+                Err(err) => panic!("open should succeed: {err}"),
+            };
+
+            if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+            if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            let l1_t2 = sstable_path(&db_dir, 2, 1);
+            assert!(
+                wait_for_path_exists(&l1_t2),
+                "compaction output should appear before reopen"
+            );
+            assert_loaded_tables_use_mmap(&engine);
+        }
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("reopen should succeed: {err}"),
+        };
+        assert_loaded_tables_use_mmap(&engine);
+
+        let val_a = match engine.get(b"a") {
+            Ok(value) => value,
+            Err(err) => panic!("get a should succeed: {err}"),
+        };
+        let val_b = match engine.get(b"b") {
+            Ok(value) => value,
+            Err(err) => panic!("get b should succeed: {err}"),
+        };
+        assert_eq!(val_a, Some(Bytes::from_static(b"1")));
+        assert_eq!(val_b, Some(Bytes::from_static(b"2")));
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn mmap_scan_across_l0_and_l1_after_compaction() {
+        let db_dir = temp_db_dir("mmap-scan-l0-l1");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.enable_mmap_reads = true;
+        opts.l0_compaction_trigger = 2;
+
+        {
+            let engine = match AetherEngine::open(opts.clone()) {
+                Ok(engine) => engine,
+                Err(err) => panic!("open should succeed: {err}"),
+            };
+
+            if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            if let Err(err) = engine.put(Bytes::from_static(b"c"), Bytes::from_static(b"3")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.put(Bytes::from_static(b"d"), Bytes::from_static(b"4")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+
+            let l1_t2 = sstable_path(&db_dir, 2, 1);
+            assert!(
+                wait_for_path_exists(&l1_t2),
+                "compaction output should appear before mixed-level scan"
+            );
+            assert_loaded_tables_use_mmap(&engine);
+        }
+
+        let items = {
+            let engine = match AetherEngine::open(opts) {
+                Ok(engine) => engine,
+                Err(err) => panic!("reopen should succeed: {err}"),
+            };
+            assert_loaded_tables_use_mmap(&engine);
+
+            if let Err(err) = engine.put(Bytes::from_static(b"e"), Bytes::from_static(b"5")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+            assert_loaded_tables_use_mmap(&engine);
+
+            let l0_t3 = sstable_path(&db_dir, 3, 0);
+            let l1_t2 = sstable_path(&db_dir, 2, 1);
+            assert!(
+                wait_for_path_exists(&l0_t3),
+                "fresh L0 table should exist for mixed-level scan"
+            );
+            assert!(
+                wait_for_path_exists(&l1_t2),
+                "compacted L1 table should exist for mixed-level scan"
+            );
+
+            match engine.scan(unbounded_scan()) {
+                Ok(items) => items,
+                Err(err) => panic!("scan should succeed: {err}"),
+            }
+        };
+
+        assert_eq!(
+            scan_kv(&items),
+            vec![
+                (b"a".to_vec(), b"1".to_vec()),
+                (b"b".to_vec(), b"2".to_vec()),
+                (b"c".to_vec(), b"3".to_vec()),
+                (b"d".to_vec(), b"4".to_vec()),
+                (b"e".to_vec(), b"5".to_vec()),
+            ]
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn mmap_reopen_reads_existing_sstables() {
+        let db_dir = temp_db_dir("mmap-reopen");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.enable_mmap_reads = true;
+
+        {
+            let engine = match AetherEngine::open(opts.clone()) {
+                Ok(engine) => engine,
+                Err(err) => panic!("open should succeed: {err}"),
+            };
+
+            if let Err(err) = engine.put(Bytes::from_static(b"k"), Bytes::from_static(b"v")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+            assert_loaded_tables_use_mmap(&engine);
+        }
+
+        let reopened = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("reopen should succeed: {err}"),
+        };
+        assert_loaded_tables_use_mmap(&reopened);
+
+        let value = match reopened.get(b"k") {
+            Ok(value) => value,
+            Err(err) => panic!("get should succeed: {err}"),
+        };
+        assert_eq!(value, Some(Bytes::from_static(b"v")));
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn mmap_delete_tombstone_hides_flushed_key() {
+        let db_dir = temp_db_dir("mmap-tombstone");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.enable_mmap_reads = true;
+
+        {
+            let engine = match AetherEngine::open(opts.clone()) {
+                Ok(engine) => engine,
+                Err(err) => panic!("open should succeed: {err}"),
+            };
+
+            if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+                panic!("put should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+            assert_loaded_tables_use_mmap(&engine);
+
+            if let Err(err) = engine.delete(Bytes::from_static(b"a")) {
+                panic!("delete should succeed: {err}");
+            }
+            if let Err(err) = engine.flush() {
+                panic!("flush should succeed: {err}");
+            }
+            assert_loaded_tables_use_mmap(&engine);
+        }
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("reopen should succeed: {err}"),
+        };
+        assert_loaded_tables_use_mmap(&engine);
+
+        let val_a = match engine.get(b"a") {
+            Ok(value) => value,
+            Err(err) => panic!("get a should succeed: {err}"),
+        };
+        let val_b = match engine.get(b"b") {
+            Ok(value) => value,
+            Err(err) => panic!("get b should succeed: {err}"),
+        };
+        assert_eq!(val_a, None, "tombstoned key should not be visible");
+        assert_eq!(val_b, Some(Bytes::from_static(b"2")));
 
         if let Err(err) = fs::remove_dir_all(&db_dir) {
             panic!("cleanup should succeed: {err}");
