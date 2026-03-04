@@ -515,6 +515,10 @@ fn emit_metrics_snapshot(
             bytes_written_total = snapshot.bytes_written_total,
             bytes_read_total = snapshot.bytes_read_total,
             tables_touched_total = snapshot.tables_touched_total,
+            block_cache_hits_total = snapshot.block_cache_hits_total,
+            block_cache_misses_total = snapshot.block_cache_misses_total,
+            block_cache_evictions_total = snapshot.block_cache_evictions_total,
+            block_cache_bytes_current = snapshot.block_cache_bytes_current,
             "metrics snapshot"
         );
     }

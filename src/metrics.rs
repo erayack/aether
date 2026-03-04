@@ -13,6 +13,10 @@ pub struct MetricsSnapshot {
     pub bytes_written_total: u64,
     pub bytes_read_total: u64,
     pub tables_touched_total: u64,
+    pub block_cache_hits_total: u64,
+    pub block_cache_misses_total: u64,
+    pub block_cache_evictions_total: u64,
+    pub block_cache_bytes_current: u64,
     pub wal_append_latency: LatencySummarySnapshot,
     pub flush_duration: LatencySummarySnapshot,
     pub compaction_duration: LatencySummarySnapshot,
@@ -42,6 +46,10 @@ struct MetricsInner {
     bytes_written: AtomicU64,
     bytes_read: AtomicU64,
     tables_touched: AtomicU64,
+    block_cache_hits: AtomicU64,
+    block_cache_misses: AtomicU64,
+    block_cache_evictions: AtomicU64,
+    block_cache_bytes_current: AtomicU64,
     wal_append_latency: RollingLatency,
     flush_duration: RollingLatency,
     compaction_duration: RollingLatency,
@@ -78,6 +86,10 @@ impl MetricsHandle {
             bytes_written_total: self.inner.bytes_written.load(Ordering::Relaxed),
             bytes_read_total: self.inner.bytes_read.load(Ordering::Relaxed),
             tables_touched_total: self.inner.tables_touched.load(Ordering::Relaxed),
+            block_cache_hits_total: self.inner.block_cache_hits.load(Ordering::Relaxed),
+            block_cache_misses_total: self.inner.block_cache_misses.load(Ordering::Relaxed),
+            block_cache_evictions_total: self.inner.block_cache_evictions.load(Ordering::Relaxed),
+            block_cache_bytes_current: self.inner.block_cache_bytes_current.load(Ordering::Relaxed),
             wal_append_latency: self.inner.wal_append_latency.snapshot(),
             flush_duration: self.inner.flush_duration.snapshot(),
             compaction_duration: self.inner.compaction_duration.snapshot(),
@@ -140,6 +152,28 @@ impl MetricsHandle {
         self.inner
             .tables_touched
             .fetch_add(bytes_to_u64(count), Ordering::Relaxed);
+    }
+
+    pub fn record_block_cache_hit(&self) {
+        self.inner.block_cache_hits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_block_cache_miss(&self) {
+        self.inner
+            .block_cache_misses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_block_cache_eviction(&self) {
+        self.inner
+            .block_cache_evictions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_block_cache_bytes_current(&self, bytes: usize) {
+        self.inner
+            .block_cache_bytes_current
+            .store(bytes_to_u64(bytes), Ordering::Relaxed);
     }
 }
 

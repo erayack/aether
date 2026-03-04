@@ -1,4 +1,4 @@
-use std::mem::size_of;
+use std::{mem::size_of, sync::Arc};
 
 use bytes::Bytes;
 
@@ -217,14 +217,18 @@ impl Default for BlockEncoder {
 // Dispatch helpers for decode / point-lookup
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn decode_block(
     block: &[u8],
     encoding: BlockEncodingKind,
 ) -> Result<Vec<InternalEntry>> {
-    match encoding {
-        BlockEncodingKind::Plain => decode_block_entries(block),
-        BlockEncodingKind::Prefix => decode_prefix_block_entries(block),
+    let mut cursor = BlockEntryCursor::new(Arc::<[u8]>::from(block.to_vec()), encoding)?;
+    let mut entries = Vec::new();
+    while let Some(entry) = cursor.next_entry()? {
+        entries.push(entry);
     }
+    Ok(entries)
 }
 
 pub(super) fn find_in_block_dispatch(
@@ -287,6 +291,8 @@ fn encode_entry(buf: &mut Vec<u8>, entry: &InternalEntry) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn decode_block_entries(block: &[u8]) -> Result<Vec<InternalEntry>> {
     let mut cursor = 0_usize;
     let entry_count = read_u32(block, &mut cursor)?;
@@ -430,32 +436,14 @@ fn parse_restart_trailer(block: &[u8]) -> Result<(usize, Vec<u32>)> {
     Ok((data_end, offsets))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 pub(super) fn decode_prefix_block_entries(block: &[u8]) -> Result<Vec<InternalEntry>> {
-    let (data_end, restart_offsets) = parse_restart_trailer(block)?;
-
-    let mut cursor = 0_usize;
-    let entry_count = read_u32(block, &mut cursor)?;
-    let count = usize::try_from(entry_count)
-        .map_err(|_| invalid_data("SSTable block entry count is not supported on this platform"))?;
-
-    validate_restart_offsets(count, data_end, &restart_offsets)?;
-
-    let mut entries = Vec::with_capacity(count);
-    let mut prev_key = Vec::new();
-    let mut decoded_entry_starts = Vec::with_capacity(count);
-
-    for _ in 0..count {
-        decoded_entry_starts.push(cursor.saturating_sub(BLOCK_ENTRY_COUNT_LEN));
-        let entry = decode_prefix_entry(block, &mut cursor, &mut prev_key)?;
+    let mut cursor = PrefixBlockCursor::new(Arc::<[u8]>::from(block.to_vec()))?;
+    let mut entries = Vec::new();
+    while let Some(entry) = cursor.next_entry()? {
         entries.push(entry);
     }
-
-    if cursor != data_end {
-        return Err(invalid_data("SSTable prefix block has unexpected data length").into());
-    }
-
-    validate_restart_offsets_against_entries(&restart_offsets, &decoded_entry_starts)?;
-
     Ok(entries)
 }
 
@@ -598,23 +586,17 @@ fn decode_prefix_entry(
 // Prefix block cursor (lazy incremental decode)
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
-pub(super) struct PrefixBlockCursor {
-    block: Vec<u8>,
+pub(super) struct PlainBlockCursor {
+    block: Arc<[u8]>,
     entry_count: usize,
-    data_end: usize,
     cursor: usize,
     entries_emitted: usize,
-    prev_key: Vec<u8>,
 }
 
-#[allow(dead_code)]
-impl PrefixBlockCursor {
-    pub(super) fn new(block: Vec<u8>) -> Result<Self> {
-        let (data_end, _restart_offsets) = parse_restart_trailer(&block)?;
-
+impl PlainBlockCursor {
+    pub(super) fn new(block: Arc<[u8]>) -> Result<Self> {
         let mut cursor = 0_usize;
-        let entry_count_u32 = read_u32(&block, &mut cursor)?;
+        let entry_count_u32 = read_u32(block.as_ref(), &mut cursor)?;
         let entry_count = usize::try_from(entry_count_u32).map_err(|_| {
             invalid_data("SSTable block entry count is not supported on this platform")
         })?;
@@ -622,9 +604,54 @@ impl PrefixBlockCursor {
         Ok(Self {
             block,
             entry_count,
+            cursor,
+            entries_emitted: 0,
+        })
+    }
+
+    pub(super) fn next_entry(&mut self) -> Result<Option<InternalEntry>> {
+        if self.entries_emitted >= self.entry_count {
+            if self.cursor != self.block.len() {
+                return Err(invalid_data("SSTable block has trailing bytes").into());
+            }
+            return Ok(None);
+        }
+        let entry = decode_entry(self.block.as_ref(), &mut self.cursor)?;
+        self.entries_emitted = self.entries_emitted.saturating_add(1);
+        Ok(Some(entry))
+    }
+}
+
+pub(super) struct PrefixBlockCursor {
+    block: Arc<[u8]>,
+    entry_count: usize,
+    data_end: usize,
+    cursor: usize,
+    entries_emitted: usize,
+    restart_offsets: Vec<u32>,
+    decoded_entry_starts: Vec<usize>,
+    prev_key: Vec<u8>,
+}
+
+impl PrefixBlockCursor {
+    pub(super) fn new(block: Arc<[u8]>) -> Result<Self> {
+        let (data_end, restart_offsets) = parse_restart_trailer(block.as_ref())?;
+
+        let mut cursor = 0_usize;
+        let entry_count_u32 = read_u32(block.as_ref(), &mut cursor)?;
+        let entry_count = usize::try_from(entry_count_u32).map_err(|_| {
+            invalid_data("SSTable block entry count is not supported on this platform")
+        })?;
+        validate_restart_offsets(entry_count, data_end, &restart_offsets)?;
+
+        Ok(Self {
+            block,
+            entry_count,
             data_end,
             cursor,
             entries_emitted: 0,
+            restart_offsets,
+            decoded_entry_starts: Vec::with_capacity(entry_count),
             prev_key: Vec::new(),
         })
     }
@@ -634,11 +661,38 @@ impl PrefixBlockCursor {
             if self.cursor != self.data_end {
                 return Err(invalid_data("SSTable prefix block has unexpected data length").into());
             }
+            validate_restart_offsets_against_entries(
+                &self.restart_offsets,
+                &self.decoded_entry_starts,
+            )?;
             return Ok(None);
         }
-        let entry = decode_prefix_entry(&self.block, &mut self.cursor, &mut self.prev_key)?;
+        self.decoded_entry_starts
+            .push(self.cursor.saturating_sub(BLOCK_ENTRY_COUNT_LEN));
+        let entry = decode_prefix_entry(self.block.as_ref(), &mut self.cursor, &mut self.prev_key)?;
         self.entries_emitted = self.entries_emitted.saturating_add(1);
         Ok(Some(entry))
+    }
+}
+
+pub(super) enum BlockEntryCursor {
+    Plain(PlainBlockCursor),
+    Prefix(PrefixBlockCursor),
+}
+
+impl BlockEntryCursor {
+    pub(super) fn new(block: Arc<[u8]>, encoding: BlockEncodingKind) -> Result<Self> {
+        match encoding {
+            BlockEncodingKind::Plain => PlainBlockCursor::new(block).map(Self::Plain),
+            BlockEncodingKind::Prefix => PrefixBlockCursor::new(block).map(Self::Prefix),
+        }
+    }
+
+    pub(super) fn next_entry(&mut self) -> Result<Option<InternalEntry>> {
+        match self {
+            Self::Plain(cursor) => cursor.next_entry(),
+            Self::Prefix(cursor) => cursor.next_entry(),
+        }
     }
 }
 
@@ -748,6 +802,7 @@ fn invalid_input(message: &'static str) -> std::io::Error {
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
+    use std::sync::Arc;
 
     use super::{
         BlockBuilder, BlockEncoder, PrefixBlockBuilder, PrefixBlockCursor, decode_block,
@@ -882,7 +937,7 @@ mod tests {
             Err(err) => panic!("encode should work: {err}"),
         };
 
-        let mut cursor = match PrefixBlockCursor::new(block) {
+        let mut cursor = match PrefixBlockCursor::new(Arc::<[u8]>::from(block)) {
             Ok(c) => c,
             Err(err) => panic!("cursor init should work: {err}"),
         };

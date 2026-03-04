@@ -3,7 +3,7 @@ use std::{cmp::Ordering, collections::BinaryHeap};
 use crate::{
     error::Result,
     sstable::reader::SsTableRangeIter,
-    types::{InternalEntry, Key, ValueEntry},
+    types::{InternalEntry, ValueEntry},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,11 +22,10 @@ pub struct SourceCursor {
 
 enum SourceKind {
     Entries {
-        entries: Vec<InternalEntry>,
-        cursor: usize,
+        entries: std::vec::IntoIter<InternalEntry>,
     },
     SsTable {
-        iter: SsTableRangeIter,
+        iter: Box<SsTableRangeIter>,
     },
 }
 
@@ -36,7 +35,9 @@ impl SourceCursor {
     pub fn from_entries(entries: Vec<InternalEntry>, source_rank: u32) -> Self {
         Self {
             source_rank,
-            kind: SourceKind::Entries { entries, cursor: 0 },
+            kind: SourceKind::Entries {
+                entries: entries.into_iter(),
+            },
         }
     }
 
@@ -45,7 +46,9 @@ impl SourceCursor {
     pub fn from_sstable_iter(iter: SsTableRangeIter, source_rank: u32) -> Self {
         Self {
             source_rank,
-            kind: SourceKind::SsTable { iter },
+            kind: SourceKind::SsTable {
+                iter: Box::new(iter),
+            },
         }
     }
 
@@ -55,14 +58,7 @@ impl SourceCursor {
 
     fn next_entry(&mut self) -> Result<Option<InternalEntry>> {
         match &mut self.kind {
-            SourceKind::Entries { entries, cursor } => {
-                if *cursor >= entries.len() {
-                    return Ok(None);
-                }
-                let entry = entries[*cursor].clone();
-                *cursor = cursor.saturating_add(1);
-                Ok(Some(entry))
-            }
+            SourceKind::Entries { entries } => Ok(entries.next()),
             SourceKind::SsTable { iter } => iter.next_entry(),
         }
     }
@@ -99,8 +95,7 @@ impl MergeIterator {
 
         while let Some(head) = self.heap.pop() {
             self.refill_source(head.source_index)?;
-            let current_key = head.entry.key.clone();
-            self.discard_key_versions(&current_key)?;
+            self.discard_key_versions(head.entry.key.as_ref())?;
 
             match self.mode {
                 MergeMode::UserScan => {
@@ -124,12 +119,12 @@ impl MergeIterator {
         Ok(())
     }
 
-    fn discard_key_versions(&mut self, key: &Key) -> Result<()> {
+    fn discard_key_versions(&mut self, key: &[u8]) -> Result<()> {
         loop {
             let should_drop = self
                 .heap
                 .peek()
-                .is_some_and(|peek| peek.entry.key.as_ref() == key.as_ref());
+                .is_some_and(|peek| peek.entry.key.as_ref() == key);
             if !should_drop {
                 return Ok(());
             }

@@ -1,4 +1,5 @@
 mod block;
+pub mod block_cache;
 mod bloom;
 pub(crate) mod io;
 pub mod reader;

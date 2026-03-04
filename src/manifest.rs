@@ -16,6 +16,14 @@ pub struct ManifestState {
     pub wal_generation: u64,
     pub wal_durable_checkpoint_offset: u64,
     pub levels: Vec<Vec<SsTableMeta>>,
+    pub pending_deletes: Vec<PendingDeleteEntry>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct PendingDeleteEntry {
+    pub table_id: u64,
+    pub level: u8,
+    pub max_seq: u64,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -25,6 +33,8 @@ struct PersistedManifestState {
     wal_generation: u64,
     wal_durable_checkpoint_offset: u64,
     levels: Vec<Vec<PersistedSsTableMeta>>,
+    #[serde(default)]
+    pending_deletes: Vec<PersistedPendingDeleteEntry>,
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -33,6 +43,13 @@ struct PersistedSsTableMeta {
     level: u8,
     min_key: Vec<u8>,
     max_key: Vec<u8>,
+    max_seq: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedPendingDeleteEntry {
+    table_id: u64,
+    level: u8,
     max_seq: u64,
 }
 
@@ -82,6 +99,26 @@ impl ManifestStore {
         sync_directory(db_dir)?;
 
         Ok(())
+    }
+}
+
+impl ManifestState {
+    pub fn enqueue_pending_delete(&mut self, entry: PendingDeleteEntry) {
+        if self
+            .pending_deletes
+            .iter()
+            .any(|queued| queued.table_id == entry.table_id && queued.level == entry.level)
+        {
+            return;
+        }
+        self.pending_deletes.push(entry);
+    }
+
+    pub fn dequeue_pending_delete(&mut self, table_id: u64, level: u8) -> bool {
+        let before = self.pending_deletes.len();
+        self.pending_deletes
+            .retain(|entry| !(entry.table_id == table_id && entry.level == level));
+        before != self.pending_deletes.len()
     }
 }
 
@@ -138,6 +175,11 @@ impl From<&ManifestState> for PersistedManifestState {
                 .iter()
                 .map(|level| level.iter().map(PersistedSsTableMeta::from).collect())
                 .collect(),
+            pending_deletes: value
+                .pending_deletes
+                .iter()
+                .map(PersistedPendingDeleteEntry::from)
+                .collect(),
         }
     }
 }
@@ -153,6 +195,11 @@ impl From<PersistedManifestState> for ManifestState {
                 .levels
                 .into_iter()
                 .map(|level| level.into_iter().map(SsTableMeta::from).collect())
+                .collect(),
+            pending_deletes: value
+                .pending_deletes
+                .into_iter()
+                .map(PendingDeleteEntry::from)
                 .collect(),
         }
     }
@@ -182,6 +229,26 @@ impl From<PersistedSsTableMeta> for SsTableMeta {
     }
 }
 
+impl From<&PendingDeleteEntry> for PersistedPendingDeleteEntry {
+    fn from(value: &PendingDeleteEntry) -> Self {
+        Self {
+            table_id: value.table_id,
+            level: value.level,
+            max_seq: value.max_seq,
+        }
+    }
+}
+
+impl From<PersistedPendingDeleteEntry> for PendingDeleteEntry {
+    fn from(value: PersistedPendingDeleteEntry) -> Self {
+        Self {
+            table_id: value.table_id,
+            level: value.level,
+            max_seq: value.max_seq,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -191,7 +258,7 @@ mod tests {
 
     use bytes::Bytes;
 
-    use super::{ManifestState, ManifestStore};
+    use super::{ManifestState, ManifestStore, PendingDeleteEntry};
     use crate::sstable::SsTableMeta;
 
     fn temp_db_dir(prefix: &str) -> std::path::PathBuf {
@@ -234,6 +301,11 @@ mod tests {
                 max_key: Bytes::from_static(b"z"),
                 max_seq: 41,
             }]],
+            pending_deletes: vec![PendingDeleteEntry {
+                table_id: 5,
+                level: 1,
+                max_seq: 40,
+            }],
         };
 
         if let Err(err) = ManifestStore::commit(&db_dir, &state) {
@@ -267,5 +339,65 @@ mod tests {
         if let Err(err) = fs::remove_dir_all(&db_dir) {
             panic!("cleanup should succeed: {err}");
         }
+    }
+
+    #[test]
+    fn load_manifest_without_pending_deletes_defaults_to_empty_queue() {
+        let db_dir = temp_db_dir("pending-default");
+        if let Err(err) = fs::create_dir_all(&db_dir) {
+            panic!("db dir create should succeed: {err}");
+        }
+
+        let manifest_payload = r#"{
+            "next_sequence_number": 9,
+            "next_table_id": 3,
+            "wal_generation": 1,
+            "wal_durable_checkpoint_offset": 128,
+            "levels": []
+        }"#;
+        if let Err(err) = fs::write(db_dir.join("MANIFEST"), manifest_payload.as_bytes()) {
+            panic!("manifest write should succeed: {err}");
+        }
+
+        let state = match ManifestStore::load_or_create(&db_dir) {
+            Ok(state) => state,
+            Err(err) => panic!("manifest load should succeed: {err}"),
+        };
+        assert!(
+            state.pending_deletes.is_empty(),
+            "pending deletes should default to empty when field is missing"
+        );
+
+        if let Err(err) = fs::remove_dir_all(&db_dir) {
+            panic!("cleanup should succeed: {err}");
+        }
+    }
+
+    #[test]
+    fn enqueue_and_dequeue_pending_delete_deduplicates_entries() {
+        let mut state = ManifestState::default();
+        state.enqueue_pending_delete(PendingDeleteEntry {
+            table_id: 11,
+            level: 0,
+            max_seq: 99,
+        });
+        state.enqueue_pending_delete(PendingDeleteEntry {
+            table_id: 11,
+            level: 0,
+            max_seq: 99,
+        });
+        assert_eq!(
+            state.pending_deletes.len(),
+            1,
+            "duplicate should be ignored"
+        );
+        assert!(
+            state.dequeue_pending_delete(11, 0),
+            "existing entry should be removed"
+        );
+        assert!(
+            !state.dequeue_pending_delete(11, 0),
+            "missing entry should report no removal"
+        );
     }
 }

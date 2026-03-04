@@ -14,7 +14,8 @@ use crate::{
 use super::{
     BlockEncodingKind, DATA_BLOCK_HEADER_LEN, FOOTER_TRAILER_LEN, FooterCompressionCodec,
     SST_MAGIC, SST_VERSION, SsTableMeta,
-    block::{decode_block, find_in_block_dispatch},
+    block::{BlockEntryCursor, find_in_block_dispatch},
+    block_cache::{BlockCache, BlockCacheKey},
     bloom::BloomFilter,
     decode_data_block_header, decode_footer, decode_footer_trailer, decode_index_entries,
     invalid_data,
@@ -29,6 +30,7 @@ pub struct SsTableReader {
     bloom: BloomFilter,
     block_encoding: BlockEncodingKind,
     compression_codec: FooterCompressionCodec,
+    block_cache: Option<Arc<BlockCache>>,
 }
 
 pub struct SsTableRangeIter {
@@ -37,10 +39,11 @@ pub struct SsTableRangeIter {
     visible_seq: u64,
     block_handles: Vec<super::BlockHandle>,
     block_index_cursor: usize,
-    in_block_entries: Vec<InternalEntry>,
-    in_block_cursor: usize,
+    active_block_cursor: Option<BlockEntryCursor>,
+    table_id: u64,
     block_encoding: BlockEncodingKind,
     compression_codec: FooterCompressionCodec,
+    block_cache: Option<Arc<BlockCache>>,
 }
 
 enum DecodedBlock<'a> {
@@ -56,6 +59,14 @@ impl DecodedBlock<'_> {
             Self::Owned(bytes) => bytes.as_ref(),
         }
     }
+
+    #[must_use]
+    fn into_arc(self) -> Arc<[u8]> {
+        match self {
+            Self::Borrowed(bytes) => Arc::<[u8]>::from(bytes.to_vec()),
+            Self::Owned(bytes) => bytes,
+        }
+    }
 }
 
 impl SsTableReader {
@@ -64,7 +75,12 @@ impl SsTableReader {
     /// # Errors
     ///
     /// Returns an error if file IO fails, the footer format is invalid, or metadata mismatches.
-    pub fn open(path: &Path, meta: SsTableMeta, enable_mmap_reads: bool) -> Result<Self> {
+    pub fn open(
+        path: &Path,
+        meta: SsTableMeta,
+        enable_mmap_reads: bool,
+        block_cache: Option<Arc<BlockCache>>,
+    ) -> Result<Self> {
         let backend = Arc::new(ReadBackend::open(path, enable_mmap_reads)?);
         let file_len = backend.len();
 
@@ -128,6 +144,7 @@ impl SsTableReader {
             bloom,
             block_encoding,
             compression_codec,
+            block_cache,
         })
     }
 
@@ -188,7 +205,14 @@ impl SsTableReader {
         };
 
         let handle = self.index[index_pos].handle;
-        let block = read_data_block_payload(&self.backend, handle, self.compression_codec)?;
+        let block = read_data_block_payload_with_cache(
+            &self.backend,
+            self.meta.table_id,
+            handle,
+            self.compression_codec,
+            self.block_encoding,
+            self.block_cache.as_deref(),
+        )?;
         let block_bytes = block.as_slice();
         find_in_block_dispatch(block_bytes, key, self.block_encoding)
     }
@@ -202,11 +226,18 @@ impl SsTableReader {
         let mut all_entries = Vec::new();
 
         for index_entry in &self.index {
-            let block =
-                read_data_block_payload(&self.backend, index_entry.handle, self.compression_codec)?;
-            let block_bytes = block.as_slice();
-            let mut entries = decode_block(block_bytes, self.block_encoding)?;
-            all_entries.append(&mut entries);
+            let block = read_data_block_payload_arc_with_cache(
+                &self.backend,
+                self.meta.table_id,
+                index_entry.handle,
+                self.compression_codec,
+                self.block_encoding,
+                self.block_cache.as_deref(),
+            )?;
+            let mut cursor = BlockEntryCursor::new(block, self.block_encoding)?;
+            while let Some(entry) = cursor.next_entry()? {
+                all_entries.push(entry);
+            }
         }
 
         Ok(all_entries)
@@ -225,10 +256,11 @@ impl SsTableReader {
                 visible_seq,
                 block_handles: Vec::new(),
                 block_index_cursor: 0,
-                in_block_entries: Vec::new(),
-                in_block_cursor: 0,
+                active_block_cursor: None,
+                table_id: self.meta.table_id,
                 block_encoding: self.block_encoding,
                 compression_codec: self.compression_codec,
+                block_cache: self.block_cache.clone(),
             });
         }
 
@@ -240,10 +272,11 @@ impl SsTableReader {
             visible_seq,
             block_handles,
             block_index_cursor: 0,
-            in_block_entries: Vec::new(),
-            in_block_cursor: 0,
+            active_block_cursor: None,
+            table_id: self.meta.table_id,
             block_encoding: self.block_encoding,
             compression_codec: self.compression_codec,
+            block_cache: self.block_cache.clone(),
         })
     }
 
@@ -282,17 +315,20 @@ impl SsTableRangeIter {
     /// Returns an error if a selected table block cannot be read or decoded.
     pub fn next_entry(&mut self) -> Result<Option<InternalEntry>> {
         loop {
-            while self.in_block_cursor < self.in_block_entries.len() {
-                let index = self.in_block_cursor;
-                self.in_block_cursor = self.in_block_cursor.saturating_add(1);
-                let entry = self.in_block_entries[index].clone();
-                if entry.seq > self.visible_seq {
-                    continue;
+            if let Some(cursor) = &mut self.active_block_cursor {
+                loop {
+                    if let Some(entry) = cursor.next_entry()? {
+                        if entry.seq > self.visible_seq {
+                            continue;
+                        }
+                        if !key_in_bounds(entry.key.as_ref(), &self.bounds) {
+                            continue;
+                        }
+                        return Ok(Some(entry));
+                    }
+                    self.active_block_cursor = None;
+                    break;
                 }
-                if !key_in_bounds(entry.key.as_ref(), &self.bounds) {
-                    continue;
-                }
-                return Ok(Some(entry));
             }
 
             if self.block_index_cursor >= self.block_handles.len() {
@@ -301,10 +337,15 @@ impl SsTableRangeIter {
 
             let handle = self.block_handles[self.block_index_cursor];
             self.block_index_cursor = self.block_index_cursor.saturating_add(1);
-            let block = read_data_block_payload(&self.backend, handle, self.compression_codec)?;
-            let block_bytes = block.as_slice();
-            self.in_block_entries = decode_block(block_bytes, self.block_encoding)?;
-            self.in_block_cursor = 0;
+            let block = read_data_block_payload_arc_with_cache(
+                &self.backend,
+                self.table_id,
+                handle,
+                self.compression_codec,
+                self.block_encoding,
+                self.block_cache.as_deref(),
+            )?;
+            self.active_block_cursor = Some(BlockEntryCursor::new(block, self.block_encoding)?);
         }
     }
 }
@@ -434,6 +475,63 @@ fn read_data_block_payload(
 ) -> Result<DecodedBlock<'_>> {
     let raw = backend.read_range_bytes(handle.offset, handle.len)?;
     decode_data_block_payload(raw, compression_codec)
+}
+
+fn read_data_block_payload_with_cache<'a>(
+    backend: &'a ReadBackend,
+    table_id: u64,
+    handle: super::BlockHandle,
+    compression_codec: FooterCompressionCodec,
+    block_encoding: BlockEncodingKind,
+    cache: Option<&BlockCache>,
+) -> Result<DecodedBlock<'a>> {
+    let Some(cache) = cache else {
+        return read_data_block_payload(backend, handle, compression_codec);
+    };
+
+    let key = resolve_block_cache_key(table_id, handle, compression_codec, block_encoding);
+    if let Some(block) = cache.get(&key) {
+        return Ok(DecodedBlock::Owned(block));
+    }
+
+    let decoded = read_data_block_payload(backend, handle, compression_codec)?;
+    let block = decoded.into_arc();
+    cache.insert(key, Arc::clone(&block));
+    Ok(DecodedBlock::Owned(block))
+}
+
+fn read_data_block_payload_arc_with_cache(
+    backend: &ReadBackend,
+    table_id: u64,
+    handle: super::BlockHandle,
+    compression_codec: FooterCompressionCodec,
+    block_encoding: BlockEncodingKind,
+    cache: Option<&BlockCache>,
+) -> Result<Arc<[u8]>> {
+    let decoded = read_data_block_payload_with_cache(
+        backend,
+        table_id,
+        handle,
+        compression_codec,
+        block_encoding,
+        cache,
+    )?;
+    Ok(decoded.into_arc())
+}
+
+const fn resolve_block_cache_key(
+    table_id: u64,
+    handle: super::BlockHandle,
+    compression_codec: FooterCompressionCodec,
+    block_encoding: BlockEncodingKind,
+) -> BlockCacheKey {
+    BlockCacheKey {
+        table_id,
+        block_offset: handle.offset,
+        block_len: handle.len,
+        codec: compression_codec.code(),
+        encoding: block_encoding.code(),
+    }
 }
 
 fn decode_data_block_payload(

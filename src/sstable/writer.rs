@@ -334,7 +334,10 @@ mod tests {
 
     use bytes::Bytes;
 
-    use super::super::{FooterCompressionCodec, decode_data_block_header, reader::SsTableReader};
+    use super::super::{
+        FooterCompressionCodec, decode_data_block_header, io::FORCE_MMAP_OPEN_FAILURE,
+        reader::SsTableReader,
+    };
     use super::*;
     use crate::types::{InternalEntry, ValueEntry};
 
@@ -373,6 +376,23 @@ mod tests {
         out
     }
 
+    struct MmapOpenFailureGuard {
+        previous: bool,
+    }
+
+    impl MmapOpenFailureGuard {
+        fn force_enabled() -> Self {
+            let previous = FORCE_MMAP_OPEN_FAILURE.with(|flag| flag.replace(true));
+            Self { previous }
+        }
+    }
+
+    impl Drop for MmapOpenFailureGuard {
+        fn drop(&mut self) {
+            FORCE_MMAP_OPEN_FAILURE.with(|flag| flag.set(self.previous));
+        }
+    }
+
     #[test]
     fn writer_and_reader_roundtrip_prefix_blocks() {
         let path = temp_sstable_path("sst-prefix-roundtrip");
@@ -408,7 +428,7 @@ mod tests {
             Err(err) => panic!("finish should work: {err}"),
         };
 
-        let reader = match SsTableReader::open(&path, meta, false) {
+        let reader = match SsTableReader::open(&path, meta, false, None) {
             Ok(reader) => reader,
             Err(err) => panic!("open should work: {err}"),
         };
@@ -464,7 +484,7 @@ mod tests {
             Err(err) => panic!("finish should work: {err}"),
         };
 
-        let reader = match SsTableReader::open(&path, meta, false) {
+        let reader = match SsTableReader::open(&path, meta, false, None) {
             Ok(reader) => reader,
             Err(err) => panic!("open should work: {err}"),
         };
@@ -518,7 +538,7 @@ mod tests {
             Err(err) => panic!("finish should work: {err}"),
         };
 
-        let reader = match SsTableReader::open(&path, meta, false) {
+        let reader = match SsTableReader::open(&path, meta, false, None) {
             Ok(reader) => reader,
             Err(err) => panic!("open should work: {err}"),
         };
@@ -572,7 +592,7 @@ mod tests {
             Err(err) => panic!("finish should work: {err}"),
         };
 
-        let reader = match SsTableReader::open(&path, meta, false) {
+        let reader = match SsTableReader::open(&path, meta, false, None) {
             Ok(reader) => reader,
             Err(err) => panic!("open should work: {err}"),
         };
@@ -592,6 +612,72 @@ mod tests {
                 Err(err) => panic!("decode header should work: {err}"),
             };
         assert!(!is_compressed);
+
+        if let Err(err) = fs::remove_file(&path) {
+            panic!("cleanup should work: {err}");
+        }
+    }
+
+    #[test]
+    fn mmap_fallback_to_file_backend_reads_correctly() {
+        let path = temp_sstable_path("sst-mmap-fallback");
+        let entries = vec![
+            put(1, b"alpha", b"v1"),
+            put(2, b"bravo", b"v2"),
+            put(3, b"charlie", b"v3"),
+        ];
+
+        let mut writer = match SsTableWriter::create(&path, 99, 0) {
+            Ok(w) => w,
+            Err(err) => panic!("writer create should work: {err}"),
+        };
+        for entry in &entries {
+            if let Err(err) = writer.add_entry(entry) {
+                panic!("add entry should work: {err}");
+            }
+        }
+        let meta = match writer.finish() {
+            Ok(m) => m,
+            Err(err) => panic!("finish should work: {err}"),
+        };
+
+        // Open with mmap enabled and verify mmap backend is selected.
+        let mmap_reader = match SsTableReader::open(&path, meta.clone(), true, None) {
+            Ok(r) => r,
+            Err(err) => panic!("mmap open should work: {err}"),
+        };
+        assert!(
+            mmap_reader.is_mmap_backend(),
+            "reader should use mmap backend when mmap succeeds"
+        );
+
+        // Force the mmap path to fail so ReadBackend::open falls back to file.
+        let _mmap_open_failure_guard = MmapOpenFailureGuard::force_enabled();
+        let fallback_reader = match SsTableReader::open(&path, meta, true, None) {
+            Ok(r) => r,
+            Err(err) => panic!("fallback open should work: {err}"),
+        };
+
+        assert!(
+            !fallback_reader.is_mmap_backend(),
+            "reader should use file backend after mmap fallback"
+        );
+
+        // Verify point lookups return the same data.
+        for entry in &entries {
+            let found = match fallback_reader.get(entry.key.as_ref()) {
+                Ok(f) => f,
+                Err(err) => panic!("get should work: {err}"),
+            };
+            assert_eq!(found, Some(entry.clone()));
+        }
+
+        // Verify full scan returns all entries in order.
+        let all = match fallback_reader.scan_all_entries() {
+            Ok(e) => e,
+            Err(err) => panic!("scan should work: {err}"),
+        };
+        assert_eq!(all, entries);
 
         if let Err(err) = fs::remove_file(&path) {
             panic!("cleanup should work: {err}");

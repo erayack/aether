@@ -15,6 +15,13 @@ use crate::error::Result;
 
 use super::invalid_data;
 
+#[cfg(test)]
+std::thread_local! {
+    /// When `true`, `ReadBackend::open` pretends mmap open failed so the
+    /// file-backend fallback path is exercised.
+    pub(super) static FORCE_MMAP_OPEN_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 pub(super) const MAX_SECTION_BYTES: usize = 128 * 1024 * 1024;
 
 pub(super) enum ReadBytes<'a> {
@@ -65,6 +72,10 @@ impl ReadBackend {
     ///
     /// Returns an error when the backing file cannot be opened.
     pub(super) fn open(path: &Path, enable_mmap_reads: bool) -> Result<Self> {
+        #[cfg(test)]
+        let enable_mmap_reads =
+            enable_mmap_reads && !FORCE_MMAP_OPEN_FAILURE.with(std::cell::Cell::get);
+
         if enable_mmap_reads {
             match sstable_mmap::ReadOnlyMmap::open(path) {
                 Ok(map) => {
