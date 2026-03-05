@@ -1,11 +1,11 @@
-use std::{collections::BTreeMap, mem, mem::size_of};
+use std::{collections::BTreeMap, mem::size_of, sync::Arc};
 
 use crate::types::{InternalEntry, Key, ScanBounds, ValueEntry};
 
 const ENTRY_OVERHEAD_BYTES: usize = 48;
 const SEQUENCE_BYTES: usize = size_of::<u64>();
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct MemTable {
     pub approx_size_bytes: usize,
     // key -> latest version for current mutable generation
@@ -47,6 +47,11 @@ impl MemTable {
     #[must_use]
     pub fn into_sorted_entries(self) -> Vec<InternalEntry> {
         self.entries.into_values().collect()
+    }
+
+    #[must_use]
+    pub fn sorted_entries(&self) -> Vec<InternalEntry> {
+        self.entries.values().cloned().collect()
     }
 
     #[must_use]
@@ -95,10 +100,19 @@ fn clone_bound(bound: &std::ops::Bound<Key>) -> std::ops::Bound<Key> {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemTableSet {
-    mutable: MemTable,
-    immutable: Option<MemTable>,
+    mutable: Arc<MemTable>,
+    immutable: Option<Arc<MemTable>>,
+}
+
+impl Default for MemTableSet {
+    fn default() -> Self {
+        Self {
+            mutable: Arc::new(MemTable::new()),
+            immutable: None,
+        }
+    }
 }
 
 #[allow(clippy::missing_const_for_fn)]
@@ -110,17 +124,27 @@ impl MemTableSet {
 
     #[must_use]
     pub fn mutable_mut(&mut self) -> &mut MemTable {
-        &mut self.mutable
+        Arc::make_mut(&mut self.mutable)
     }
 
     #[must_use]
     pub fn mutable(&self) -> &MemTable {
-        &self.mutable
+        self.mutable.as_ref()
+    }
+
+    #[must_use]
+    pub fn mutable_arc(&self) -> Arc<MemTable> {
+        Arc::clone(&self.mutable)
     }
 
     #[must_use]
     pub fn immutable(&self) -> Option<&MemTable> {
-        self.immutable.as_ref()
+        self.immutable.as_deref()
+    }
+
+    #[must_use]
+    pub fn immutable_arc(&self) -> Option<Arc<MemTable>> {
+        self.immutable.as_ref().map(Arc::clone)
     }
 
     #[must_use]
@@ -140,7 +164,8 @@ impl MemTableSet {
             return false;
         }
 
-        self.immutable = Some(mem::take(&mut self.mutable));
+        self.immutable = Some(Arc::clone(&self.mutable));
+        self.mutable = Arc::new(MemTable::new());
         true
     }
 
@@ -152,18 +177,19 @@ impl MemTableSet {
             return false;
         }
 
-        self.immutable = Some(mem::take(&mut self.mutable));
+        self.immutable = Some(Arc::clone(&self.mutable));
+        self.mutable = Arc::new(MemTable::new());
         true
     }
 
     #[must_use]
-    pub fn take_immutable(&mut self) -> Option<MemTable> {
+    pub fn take_immutable(&mut self) -> Option<Arc<MemTable>> {
         self.immutable.take()
     }
 
     #[must_use]
-    pub fn take_mutable(&mut self) -> MemTable {
-        mem::take(&mut self.mutable)
+    pub fn take_mutable(&mut self) -> Arc<MemTable> {
+        std::mem::replace(&mut self.mutable, Arc::new(MemTable::new()))
     }
 
     #[must_use]

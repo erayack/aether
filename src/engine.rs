@@ -86,6 +86,7 @@ struct ReadState {
 struct TableCache {
     l0: Vec<TableHandle>,
     l1: Vec<TableHandle>,
+    l1_non_overlapping: bool,
 }
 
 struct TableHandle {
@@ -93,12 +94,21 @@ struct TableHandle {
     reader: Arc<SsTableReader>,
 }
 
+struct PointReadView {
+    mutable: Arc<MemTable>,
+    immutable: Option<Arc<MemTable>>,
+    l0_tables: Vec<TableHandle>,
+    l1_tables: Vec<TableHandle>,
+    l1_non_overlapping: bool,
+}
+
 pub(crate) struct PinnedReadState {
     visible_seq: u64,
-    mutable_entries: Vec<InternalEntry>,
-    immutable_entries: Vec<InternalEntry>,
+    mutable: Arc<MemTable>,
+    immutable: Option<Arc<MemTable>>,
     l0_tables: Vec<TableSource>,
     l1_tables: Vec<TableSource>,
+    l1_non_overlapping: bool,
 }
 
 struct ReadSnapshot {
@@ -112,6 +122,8 @@ struct ReadSnapshot {
 pub(crate) struct TableSource {
     reader: Arc<SsTableReader>,
     source_rank: u32,
+    min_key: Bytes,
+    max_key: Bytes,
 }
 
 #[derive(Default)]
@@ -166,6 +178,7 @@ struct CompactionPlan {
     reserved_table_id: u64,
     db_dir: PathBuf,
     settings: SstableWriteSettings,
+    selection: CompactionSelection,
     removed_tables: Vec<SsTableMeta>,
     removed_ids: HashSet<u64>,
     input_l0_table_ids: Vec<u64>,
@@ -175,13 +188,9 @@ struct CompactionPlan {
 }
 
 struct CompactionOutput {
+    new_l1_table: Option<TableHandle>,
     output_entries: usize,
     output_table_ids: Vec<u64>,
-    new_l1_table: Option<TableHandle>,
-}
-
-struct CompactionCommit {
-    obsolete_files: Vec<ObsoleteTableFile>,
 }
 
 #[derive(Clone)]
@@ -402,23 +411,10 @@ impl AetherEngine {
     }
 
     fn build_pinned_read_state(&self, visible_seq: u64) -> Result<PinnedReadState> {
-        use std::ops::Bound;
-
         let read_state = self.inner.read_state.read();
-        let all_bounds = ScanBounds {
-            start: Bound::Unbounded,
-            end: Bound::Unbounded,
-        };
-        let mutable_entries = read_state
-            .memtables
-            .mutable()
-            .range_entries(&all_bounds, visible_seq);
-        let immutable_entries = read_state
-            .memtables
-            .immutable()
-            .map_or_else(Vec::new, |memtable| {
-                memtable.range_entries(&all_bounds, visible_seq)
-            });
+        let mutable = read_state.memtables.mutable_arc();
+        let immutable = read_state.memtables.immutable_arc();
+        let l1_non_overlapping = read_state.table_cache.l1_non_overlapping;
 
         let mut l0_tables = Vec::with_capacity(read_state.table_cache.l0.len());
         for (index, table) in read_state.table_cache.l0.iter().enumerate() {
@@ -430,6 +426,8 @@ impl AetherEngine {
             l0_tables.push(TableSource {
                 reader: Arc::clone(&table.reader),
                 source_rank,
+                min_key: table.meta.min_key.clone(),
+                max_key: table.meta.max_key.clone(),
             });
         }
 
@@ -443,6 +441,8 @@ impl AetherEngine {
             l1_tables.push(TableSource {
                 reader: Arc::clone(&table.reader),
                 source_rank,
+                min_key: table.meta.min_key.clone(),
+                max_key: table.meta.max_key.clone(),
             });
         }
 
@@ -450,11 +450,46 @@ impl AetherEngine {
 
         Ok(PinnedReadState {
             visible_seq,
-            mutable_entries,
-            immutable_entries,
+            mutable,
+            immutable,
             l0_tables,
             l1_tables,
+            l1_non_overlapping,
         })
+    }
+
+    fn build_point_read_view(&self) -> PointReadView {
+        let read_state = self.inner.read_state.read();
+        let mutable = read_state.memtables.mutable_arc();
+        let immutable = read_state.memtables.immutable_arc();
+        let l1_non_overlapping = read_state.table_cache.l1_non_overlapping;
+        let l0_tables = read_state
+            .table_cache
+            .l0
+            .iter()
+            .map(|table| TableHandle {
+                meta: table.meta.clone(),
+                reader: Arc::clone(&table.reader),
+            })
+            .collect();
+        let l1_tables = read_state
+            .table_cache
+            .l1
+            .iter()
+            .map(|table| TableHandle {
+                meta: table.meta.clone(),
+                reader: Arc::clone(&table.reader),
+            })
+            .collect();
+        drop(read_state);
+
+        PointReadView {
+            mutable,
+            immutable,
+            l0_tables,
+            l1_tables,
+            l1_non_overlapping,
+        }
     }
 
     fn build_read_snapshot(&self, options: &ScanOptions, visible_seq: u64) -> Result<ReadSnapshot> {
@@ -485,6 +520,8 @@ impl AetherEngine {
             l0_tables.push(TableSource {
                 reader: Arc::clone(&table.reader),
                 source_rank,
+                min_key: table.meta.min_key.clone(),
+                max_key: table.meta.max_key.clone(),
             });
         }
 
@@ -503,6 +540,8 @@ impl AetherEngine {
             l1_tables.push(TableSource {
                 reader: Arc::clone(&table.reader),
                 source_rank,
+                min_key: table.meta.min_key.clone(),
+                max_key: table.meta.max_key.clone(),
             });
         }
 
@@ -595,9 +634,12 @@ impl AetherEngine {
         }
 
         let options = ScanOptions { bounds, limit };
-        let mutable_entries = filter_entries_by_bounds(&pinned.mutable_entries, &options.bounds);
-        let immutable_entries =
-            filter_entries_by_bounds(&pinned.immutable_entries, &options.bounds);
+        let mutable_entries = pinned
+            .mutable
+            .range_entries(&options.bounds, pinned.visible_seq);
+        let immutable_entries = pinned.immutable.as_ref().map_or_else(Vec::new, |memtable| {
+            memtable.range_entries(&options.bounds, pinned.visible_seq)
+        });
         let mut sources = vec![
             SourceCursor::from_entries(mutable_entries, 0),
             SourceCursor::from_entries(immutable_entries, 1),
@@ -634,6 +676,59 @@ impl AetherEngine {
         }
 
         Ok(output)
+    }
+
+    pub(crate) fn get_pinned(&self, key: &[u8], pinned: &PinnedReadState) -> Result<Option<Value>> {
+        self.ensure_background_workers_healthy()?;
+        self.inner.metrics.add_bytes_read(key.len());
+
+        let (result, tables_touched) = if let Some(entry) = pinned.mutable.get(key) {
+            if entry.seq <= pinned.visible_seq {
+                (decode_entry(entry), 0)
+            } else {
+                lookup_sstable_sources_at_sequence(
+                    key,
+                    pinned.visible_seq,
+                    &pinned.l0_tables,
+                    &pinned.l1_tables,
+                    pinned.l1_non_overlapping,
+                )?
+            }
+        } else if let Some(immutable) = pinned.immutable.as_ref() {
+            if let Some(entry) = immutable.get(key) {
+                if entry.seq <= pinned.visible_seq {
+                    (decode_entry(entry), 0)
+                } else {
+                    lookup_sstable_sources_at_sequence(
+                        key,
+                        pinned.visible_seq,
+                        &pinned.l0_tables,
+                        &pinned.l1_tables,
+                        pinned.l1_non_overlapping,
+                    )?
+                }
+            } else {
+                lookup_sstable_sources_at_sequence(
+                    key,
+                    pinned.visible_seq,
+                    &pinned.l0_tables,
+                    &pinned.l1_tables,
+                    pinned.l1_non_overlapping,
+                )?
+            }
+        } else {
+            lookup_sstable_sources_at_sequence(
+                key,
+                pinned.visible_seq,
+                &pinned.l0_tables,
+                &pinned.l1_tables,
+                pinned.l1_non_overlapping,
+            )?
+        };
+
+        self.inner.metrics.add_tables_touched(tables_touched);
+        self.maybe_emit_metrics_snapshot("read");
+        Ok(result)
     }
 
     fn apply_write(&self, key: Key, value: ValueEntry) -> Result<()> {
@@ -782,15 +877,17 @@ impl AetherEngine {
     }
 
     fn handle_flush_job(&self, job: FlushJob) -> Result<()> {
+        let FlushJob {
+            generation,
+            memtable,
+            completion: _,
+        } = job;
         let flush_started_at = Instant::now();
-        let input_bytes = job.memtable.approx_size_bytes;
-        let input_entries = job.memtable.len();
+        let input_bytes = memtable.approx_size_bytes;
+        let input_entries = memtable.len();
         info!(
             event = "flush.start",
-            generation = job.generation,
-            input_bytes,
-            input_entries,
-            "flush started"
+            generation, input_bytes, input_entries, "flush started"
         );
 
         let result = (|| {
@@ -810,7 +907,7 @@ impl AetherEngine {
             // land in a WAL generation that won't be replayed.
             let table = flush_memtable_to_sstable(
                 &db_dir,
-                job.memtable,
+                memtable.as_ref(),
                 table_id,
                 &sstable_write_settings(&self.inner),
             )?;
@@ -834,7 +931,7 @@ impl AetherEngine {
                 .record_flush_job_with_duration(flush_started_at.elapsed());
             info!(
                 event = "flush.end",
-                generation = job.generation,
+                generation,
                 output_table_id = table_id,
                 output_table_level = 0_u8,
                 input_bytes,
@@ -851,7 +948,7 @@ impl AetherEngine {
             self.record_background_error(format!("flush worker failure: {err}"));
             error!(
                 event = "flush.error",
-                generation = job.generation,
+                generation,
                 input_bytes,
                 input_entries,
                 error = %err,
@@ -875,13 +972,15 @@ impl AetherEngine {
         };
 
         let reason = compaction_reason_label(plan.reason);
+        let input_l0_tables = plan.selection.selected_l0.len();
+        let input_l1_tables = plan.selection.selected_l1.len();
         let input_l0_table_ids = plan.input_l0_table_ids.clone();
         let input_l1_table_ids = plan.input_l1_table_ids.clone();
         info!(
             event = "compaction.start",
             reason,
-            input_l0_tables = input_l0_table_ids.len(),
-            input_l1_tables = input_l1_table_ids.len(),
+            input_l0_tables,
+            input_l1_tables,
             ?input_l0_table_ids,
             ?input_l1_table_ids,
             "compaction started"
@@ -890,14 +989,25 @@ impl AetherEngine {
         let output = self.stream_compaction_output(&plan)?;
         let output_entries = output.output_entries;
         let output_table_ids = output.output_table_ids.clone();
+        let obsolete_files = obsolete_table_files_from_metas(&plan.db_dir, &plan.removed_tables);
+        let CompactionOutput {
+            new_l1_table,
+            output_entries: _,
+            output_table_ids: _,
+        } = output;
 
-        let commit = {
+        {
             let mut write_state = self.inner.write_state.lock();
             let mut read_state = self.inner.read_state.write();
-            Self::apply_compaction_commit(&mut write_state, &mut read_state, &plan, output)?
-        };
+            Self::apply_compaction_commit_locked(
+                &mut write_state,
+                &mut read_state,
+                &plan,
+                new_l1_table,
+            )?;
+        }
 
-        self.enqueue_obsolete_tables(commit.obsolete_files);
+        self.enqueue_obsolete_tables(obsolete_files);
         self.try_cleanup_obsolete_tables();
 
         self.inner
@@ -906,8 +1016,8 @@ impl AetherEngine {
         info!(
             event = "compaction.end",
             reason,
-            input_l0_tables = input_l0_table_ids.len(),
-            input_l1_tables = input_l1_table_ids.len(),
+            input_l0_tables,
+            input_l1_tables,
             output_tables = output_table_ids.len(),
             output_entries,
             ?output_table_ids,
@@ -949,19 +1059,26 @@ impl AetherEngine {
             .iter()
             .map(|meta| meta.table_id)
             .collect::<Vec<_>>();
+        let l1_metas = read_state
+            .table_cache
+            .l1
+            .iter()
+            .map(|table| table.meta.clone())
+            .collect::<Vec<_>>();
         let removed_tables = collect_removed_tables(&selection);
         let removed_ids = removed_tables
             .iter()
             .map(|meta| meta.table_id)
             .collect::<HashSet<_>>();
-        let drop_tombstones = can_drop_compaction_tombstones(&read_state.table_cache, &selection);
-        let sources = capture_compaction_sources(&read_state.table_cache, &selection)?;
+        let drop_tombstones = can_drop_compaction_tombstones_from_l1(&l1_metas, &selection);
+        let sources = build_compaction_sources(&read_state.table_cache, &selection)?;
 
         Ok(Some(CompactionPlan {
             reason: job.reason,
             reserved_table_id,
             db_dir: write_state.db_dir.clone(),
             settings: sstable_write_settings(&self.inner),
+            selection,
             removed_tables,
             removed_ids,
             input_l0_table_ids,
@@ -975,7 +1092,7 @@ impl AetherEngine {
         #[cfg(not(test))]
         let _ = &self.inner;
 
-        let source_cursors = build_compaction_source_cursors(&plan.sources)?;
+        let source_cursors = build_compaction_sources_from_snapshot(&plan.sources)?;
         let mut merge_iter = MergeIterator::new(MergeMode::Compaction, source_cursors);
 
         let output_path = sstable_path(&plan.db_dir, plan.reserved_table_id, 1);
@@ -1037,36 +1154,34 @@ impl AetherEngine {
             .unwrap_or_default();
 
         Ok(CompactionOutput {
+            new_l1_table,
             output_entries,
             output_table_ids,
-            new_l1_table,
         })
     }
 
-    fn apply_compaction_commit(
+    fn apply_compaction_commit_locked(
         write_state: &mut WriteState,
         read_state: &mut ReadState,
         plan: &CompactionPlan,
-        output: CompactionOutput,
-    ) -> Result<CompactionCommit> {
+        new_l1_table: Option<TableHandle>,
+    ) -> Result<()> {
         apply_compaction_manifest_changes(
             &mut write_state.manifest,
             &plan.removed_ids,
             &plan.removed_tables,
-            output.new_l1_table.as_ref(),
+            new_l1_table.as_ref(),
         );
 
         ManifestStore::commit(&write_state.db_dir, &write_state.manifest)?;
 
         read_state.table_cache.remove_tables(&plan.removed_ids);
-        if let Some(table) = output.new_l1_table {
+        if let Some(table) = new_l1_table {
             read_state.table_cache.insert(table);
         }
         read_state.manifest_snapshot = write_state.manifest.clone();
 
-        let obsolete_files =
-            obsolete_table_files_from_metas(&write_state.db_dir, &plan.removed_tables);
-        Ok(CompactionCommit { obsolete_files })
+        Ok(())
     }
 
     fn maybe_emit_metrics_snapshot(&self, reason: &'static str) {
@@ -1246,66 +1361,23 @@ impl KvStore for AetherEngine {
     fn get(&self, key: &[u8]) -> Result<Option<Value>> {
         self.ensure_background_workers_healthy()?;
         self.inner.metrics.add_bytes_read(key.len());
-        let read_state = self.inner.read_state.read();
+        let view = self.build_point_read_view();
 
-        let (result, tables_touched) = if let Some(entry) = read_state.memtables.mutable().get(key)
-        {
-            let value = match &entry.value {
-                ValueEntry::Put(value) => Some(value.clone()),
-                ValueEntry::Tombstone => None,
-            };
-            (value, 0)
-        } else if let Some(immutable) = read_state.memtables.immutable()
+        let (result, tables_touched) = if let Some(entry) = view.mutable.get(key) {
+            (decode_entry(entry), 0)
+        } else if let Some(immutable) = view.immutable.as_ref()
             && let Some(entry) = immutable.get(key)
         {
-            let value = match &entry.value {
-                ValueEntry::Put(value) => Some(value.clone()),
-                ValueEntry::Tombstone => None,
-            };
-            (value, 0)
+            (decode_entry(entry), 0)
         } else {
-            let mut tables_touched = 0_usize;
-
-            let mut l0_hit: Option<Option<Value>> = None;
-            for table in &read_state.table_cache.l0 {
-                tables_touched = tables_touched.saturating_add(1);
-                if let Some(entry) = table.reader.get(key)? {
-                    l0_hit = Some(match entry.value {
-                        ValueEntry::Put(value) => Some(value),
-                        ValueEntry::Tombstone => None,
-                    });
-                    break;
-                }
-            }
-
-            if let Some(value) = l0_hit {
-                (value, tables_touched)
-            } else {
-                let mut best_l1_entry: Option<InternalEntry> = None;
-                for table in &read_state.table_cache.l1 {
-                    if key < table.meta.min_key.as_ref() || key > table.meta.max_key.as_ref() {
-                        continue;
-                    }
-
-                    tables_touched = tables_touched.saturating_add(1);
-                    if let Some(entry) = table.reader.get(key)? {
-                        match &best_l1_entry {
-                            Some(current_best) if current_best.seq > entry.seq => {}
-                            _ => best_l1_entry = Some(entry),
-                        }
-                    }
-                }
-
-                (
-                    best_l1_entry.and_then(|entry| match entry.value {
-                        ValueEntry::Put(value) => Some(value),
-                        ValueEntry::Tombstone => None,
-                    }),
-                    tables_touched,
-                )
-            }
+            lookup_sstables_in_view_at_sequence(
+                key,
+                u64::MAX,
+                &view.l0_tables,
+                &view.l1_tables,
+                view.l1_non_overlapping,
+            )?
         };
-        drop(read_state);
 
         self.inner.metrics.add_tables_touched(tables_touched);
         self.maybe_emit_metrics_snapshot("read");
@@ -1403,6 +1475,7 @@ impl TableCache {
         for table in tables {
             cache.insert(table);
         }
+        cache.refresh_l1_non_overlapping();
         cache
     }
 
@@ -1422,6 +1495,7 @@ impl TableCache {
                 .cmp(right.meta.min_key.as_ref())
                 .then(left.meta.table_id.cmp(&right.meta.table_id))
         });
+        self.refresh_l1_non_overlapping();
     }
 
     fn remove_tables(&mut self, table_ids: &HashSet<u64>) {
@@ -1429,6 +1503,11 @@ impl TableCache {
             .retain(|table| !table_ids.contains(&table.meta.table_id));
         self.l1
             .retain(|table| !table_ids.contains(&table.meta.table_id));
+        self.refresh_l1_non_overlapping();
+    }
+
+    fn refresh_l1_non_overlapping(&mut self) {
+        self.l1_non_overlapping = l1_ranges_non_overlapping_table_handles(&self.l1);
     }
 }
 
@@ -1473,7 +1552,7 @@ impl CompactionSelection {
     }
 }
 
-fn capture_compaction_sources(
+fn build_compaction_sources(
     table_cache: &TableCache,
     selection: &CompactionSelection,
 ) -> Result<Vec<TableSource>> {
@@ -1503,6 +1582,8 @@ fn capture_compaction_sources(
         sources.push(TableSource {
             reader: Arc::clone(&table.reader),
             source_rank,
+            min_key: table.meta.min_key.clone(),
+            max_key: table.meta.max_key.clone(),
         });
     }
 
@@ -1519,13 +1600,15 @@ fn capture_compaction_sources(
         sources.push(TableSource {
             reader: Arc::clone(&table.reader),
             source_rank,
+            min_key: table.meta.min_key.clone(),
+            max_key: table.meta.max_key.clone(),
         });
     }
 
     Ok(sources)
 }
 
-fn build_compaction_source_cursors(sources: &[TableSource]) -> Result<Vec<SourceCursor>> {
+fn build_compaction_sources_from_snapshot(sources: &[TableSource]) -> Result<Vec<SourceCursor>> {
     let mut cursors = Vec::with_capacity(sources.len());
     for source in sources {
         let iter = source.reader.iter_all()?;
@@ -1534,25 +1617,20 @@ fn build_compaction_source_cursors(sources: &[TableSource]) -> Result<Vec<Source
     Ok(cursors)
 }
 
-fn can_drop_compaction_tombstones(
-    table_cache: &TableCache,
+fn can_drop_compaction_tombstones_from_l1(
+    l1_metas: &[SsTableMeta],
     selection: &CompactionSelection,
 ) -> bool {
-    if !l1_ranges_non_overlapping(&table_cache.l1) {
+    if !l1_ranges_non_overlapping(l1_metas) {
         return false;
     }
 
-    let overlapping_l1_ids = table_cache
-        .l1
+    let overlapping_l1_ids = l1_metas
         .iter()
-        .filter(|table| {
-            table_key_ranges_overlap(
-                &table.meta,
-                selection.min_key.as_ref(),
-                selection.max_key.as_ref(),
-            )
+        .filter(|meta| {
+            table_key_ranges_overlap(meta, selection.min_key.as_ref(), selection.max_key.as_ref())
         })
-        .map(|table| table.meta.table_id)
+        .map(|meta| meta.table_id)
         .collect::<HashSet<_>>();
     let selected_l1_ids = selection
         .selected_l1
@@ -1563,11 +1641,19 @@ fn can_drop_compaction_tombstones(
     overlapping_l1_ids == selected_l1_ids
 }
 
-fn l1_ranges_non_overlapping(l1_tables: &[TableHandle]) -> bool {
-    l1_tables.windows(2).all(|pair| {
-        let left = &pair[0].meta;
-        let right = &pair[1].meta;
+fn l1_ranges_non_overlapping(l1_metas: &[SsTableMeta]) -> bool {
+    l1_metas.windows(2).all(|pair| {
+        let left = &pair[0];
+        let right = &pair[1];
         left.max_key.as_ref() < right.min_key.as_ref()
+    })
+}
+
+fn l1_ranges_non_overlapping_table_handles(l1_tables: &[TableHandle]) -> bool {
+    l1_tables.windows(2).all(|pair| {
+        let left = &pair[0];
+        let right = &pair[1];
+        left.meta.max_key.as_ref() < right.meta.min_key.as_ref()
     })
 }
 
@@ -1751,31 +1837,165 @@ fn table_overlaps_bounds(meta: &SsTableMeta, bounds: &ScanBounds) -> bool {
     above_start && below_end
 }
 
-fn filter_entries_by_bounds(entries: &[InternalEntry], bounds: &ScanBounds) -> Vec<InternalEntry> {
-    entries
-        .iter()
-        .filter(|entry| key_within_bounds(entry.key.as_ref(), bounds))
-        .cloned()
-        .collect()
+fn decode_entry(entry: &InternalEntry) -> Option<Value> {
+    match &entry.value {
+        ValueEntry::Put(value) => Some(value.clone()),
+        ValueEntry::Tombstone => None,
+    }
 }
 
-fn key_within_bounds(key: &[u8], bounds: &ScanBounds) -> bool {
+fn point_bounds(key: &[u8]) -> ScanBounds {
     use std::ops::Bound;
 
-    let above_start = match &bounds.start {
-        Bound::Included(start) => key >= start.as_ref(),
-        Bound::Excluded(start) => key > start.as_ref(),
-        Bound::Unbounded => true,
-    };
-    if !above_start {
-        return false;
+    let key = Bytes::copy_from_slice(key);
+    ScanBounds {
+        start: Bound::Included(key.clone()),
+        end: Bound::Included(key),
+    }
+}
+
+fn lookup_sstables_in_view_at_sequence(
+    key: &[u8],
+    visible_seq: u64,
+    l0_tables: &[TableHandle],
+    l1_tables: &[TableHandle],
+    l1_non_overlapping: bool,
+) -> Result<(Option<Value>, usize)> {
+    let mut tables_touched = 0_usize;
+    let mut l0_hit: Option<Option<Value>> = None;
+
+    if visible_seq == u64::MAX {
+        for table in l0_tables {
+            tables_touched = tables_touched.saturating_add(1);
+            if let Some(entry) = table.reader.get(key)? {
+                l0_hit = Some(decode_entry(&entry));
+                break;
+            }
+        }
+    } else {
+        let bounds = point_bounds(key);
+        for table in l0_tables {
+            tables_touched = tables_touched.saturating_add(1);
+            let mut iter = table.reader.iter_range(&bounds, visible_seq)?;
+            if let Some(entry) = iter.next_entry()? {
+                l0_hit = Some(decode_entry(&entry));
+                break;
+            }
+        }
     }
 
-    match &bounds.end {
-        Bound::Included(end) => key <= end.as_ref(),
-        Bound::Excluded(end) => key < end.as_ref(),
-        Bound::Unbounded => true,
+    if let Some(value) = l0_hit {
+        return Ok((value, tables_touched));
     }
+
+    let mut best_l1_entry: Option<InternalEntry> = None;
+    if l1_non_overlapping {
+        if let Some(index) = find_l1_table_index_by_key(key, l1_tables) {
+            let table = &l1_tables[index];
+            tables_touched = tables_touched.saturating_add(1);
+            if visible_seq == u64::MAX {
+                best_l1_entry = table.reader.get(key)?;
+            } else {
+                let bounds = point_bounds(key);
+                let mut iter = table.reader.iter_range(&bounds, visible_seq)?;
+                best_l1_entry = iter.next_entry()?;
+            }
+        }
+    } else if visible_seq == u64::MAX {
+        for table in l1_tables {
+            if key < table.meta.min_key.as_ref() || key > table.meta.max_key.as_ref() {
+                continue;
+            }
+
+            tables_touched = tables_touched.saturating_add(1);
+            if let Some(entry) = table.reader.get(key)? {
+                match &best_l1_entry {
+                    Some(current_best) if current_best.seq > entry.seq => {}
+                    _ => best_l1_entry = Some(entry),
+                }
+            }
+        }
+    } else {
+        let bounds = point_bounds(key);
+        for table in l1_tables {
+            if key < table.meta.min_key.as_ref() || key > table.meta.max_key.as_ref() {
+                continue;
+            }
+
+            tables_touched = tables_touched.saturating_add(1);
+            let mut iter = table.reader.iter_range(&bounds, visible_seq)?;
+            if let Some(entry) = iter.next_entry()? {
+                match &best_l1_entry {
+                    Some(current_best) if current_best.seq > entry.seq => {}
+                    _ => best_l1_entry = Some(entry),
+                }
+            }
+        }
+    }
+
+    Ok((
+        best_l1_entry.as_ref().and_then(decode_entry),
+        tables_touched,
+    ))
+}
+
+fn lookup_sstable_sources_at_sequence(
+    key: &[u8],
+    visible_seq: u64,
+    l0_tables: &[TableSource],
+    l1_tables: &[TableSource],
+    l1_non_overlapping: bool,
+) -> Result<(Option<Value>, usize)> {
+    let mut tables_touched = 0_usize;
+    let bounds = point_bounds(key);
+
+    for table in l0_tables {
+        tables_touched = tables_touched.saturating_add(1);
+        let mut iter = table.reader.iter_range(&bounds, visible_seq)?;
+        if let Some(entry) = iter.next_entry()? {
+            return Ok((decode_entry(&entry), tables_touched));
+        }
+    }
+
+    let mut best_l1_entry: Option<InternalEntry> = None;
+    if l1_non_overlapping {
+        if let Some(index) = find_l1_source_index_by_key(key, l1_tables) {
+            let table = &l1_tables[index];
+            tables_touched = tables_touched.saturating_add(1);
+            let mut iter = table.reader.iter_range(&bounds, visible_seq)?;
+            best_l1_entry = iter.next_entry()?;
+        }
+    } else {
+        for table in l1_tables {
+            tables_touched = tables_touched.saturating_add(1);
+            let mut iter = table.reader.iter_range(&bounds, visible_seq)?;
+            if let Some(entry) = iter.next_entry()? {
+                match &best_l1_entry {
+                    Some(current_best) if current_best.seq > entry.seq => {}
+                    _ => best_l1_entry = Some(entry),
+                }
+            }
+        }
+    }
+
+    Ok((
+        best_l1_entry.as_ref().and_then(decode_entry),
+        tables_touched,
+    ))
+}
+
+fn find_l1_table_index_by_key(key: &[u8], l1_tables: &[TableHandle]) -> Option<usize> {
+    let upper_bound = l1_tables.partition_point(|table| table.meta.min_key.as_ref() <= key);
+    upper_bound
+        .checked_sub(1)
+        .filter(|index| key <= l1_tables[*index].meta.max_key.as_ref())
+}
+
+fn find_l1_source_index_by_key(key: &[u8], l1_tables: &[TableSource]) -> Option<usize> {
+    let upper_bound = l1_tables.partition_point(|table| table.min_key.as_ref() <= key);
+    upper_bound
+        .checked_sub(1)
+        .filter(|index| key <= l1_tables[*index].max_key.as_ref())
 }
 
 fn has_invalid_scan_bounds(bounds: &ScanBounds) -> bool {
@@ -1829,11 +2049,11 @@ fn sstable_write_settings(inner: &Inner) -> SstableWriteSettings {
 
 fn flush_memtable_to_sstable(
     db_dir: &Path,
-    mutable: MemTable,
+    mutable: &MemTable,
     table_id: u64,
     settings: &SstableWriteSettings,
 ) -> Result<TableHandle> {
-    let entries = mutable.into_sorted_entries();
+    let entries = mutable.sorted_entries();
     if entries.is_empty() {
         return Err(invalid_data("cannot flush empty memtable").into());
     }

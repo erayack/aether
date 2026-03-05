@@ -3,11 +3,12 @@
 //! The main crate uses this module to load on-disk byte ranges while keeping
 //! memory-mapping unsafe internals inside the `sstable-mmap` helper crate.
 
-use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-    path::Path,
-};
+use std::{fs::File, path::Path};
+
+#[cfg(unix)]
+use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 
 use tracing::warn;
 
@@ -146,11 +147,7 @@ impl ReadBackend {
         match self {
             Self::File(backend) => {
                 let mut out = vec![0_u8; len_usize];
-                // Clone the descriptor per read to avoid a shared seek cursor lock
-                // serializing all file-backed table reads.
-                let mut file = backend.file.try_clone()?;
-                file.seek(SeekFrom::Start(offset))?;
-                file.read_exact(&mut out)?;
+                backend.file.read_exact_at(&mut out, offset)?;
                 Ok(ReadBytes::Owned(out))
             }
             Self::Mmap(backend) => {

@@ -1,4 +1,5 @@
 use std::{
+    sync::Arc,
     sync::mpsc::{Receiver, SyncSender},
     thread::{self, JoinHandle},
 };
@@ -7,7 +8,7 @@ use crate::{error::Result, memtable::MemTable};
 
 pub struct FlushJob {
     pub generation: u64,
-    pub memtable: MemTable,
+    pub memtable: Arc<MemTable>,
     pub completion: Option<SyncSender<Result<()>>>,
 }
 

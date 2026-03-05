@@ -1,4 +1,4 @@
-use std::{mem::size_of, sync::Arc};
+use std::{collections::HashSet, mem::size_of, sync::Arc};
 
 use bytes::Bytes;
 
@@ -520,7 +520,7 @@ fn validate_restart_offsets(count: usize, data_end: usize, restart_offsets: &[u3
 
 fn validate_restart_offsets_against_entries(
     restart_offsets: &[u32],
-    decoded_entry_starts: &[usize],
+    decoded_entry_starts: &HashSet<usize>,
 ) -> Result<()> {
     for restart in restart_offsets {
         let restart = usize::try_from(*restart)
@@ -629,7 +629,7 @@ pub(super) struct PrefixBlockCursor {
     cursor: usize,
     entries_emitted: usize,
     restart_offsets: Vec<u32>,
-    decoded_entry_starts: Vec<usize>,
+    decoded_entry_starts: HashSet<usize>,
     prev_key: Vec<u8>,
 }
 
@@ -651,7 +651,7 @@ impl PrefixBlockCursor {
             cursor,
             entries_emitted: 0,
             restart_offsets,
-            decoded_entry_starts: Vec::with_capacity(entry_count),
+            decoded_entry_starts: HashSet::with_capacity(entry_count),
             prev_key: Vec::new(),
         })
     }
@@ -668,7 +668,7 @@ impl PrefixBlockCursor {
             return Ok(None);
         }
         self.decoded_entry_starts
-            .push(self.cursor.saturating_sub(BLOCK_ENTRY_COUNT_LEN));
+            .insert(self.cursor.saturating_sub(BLOCK_ENTRY_COUNT_LEN));
         let entry = decode_prefix_entry(self.block.as_ref(), &mut self.cursor, &mut self.prev_key)?;
         self.entries_emitted = self.entries_emitted.saturating_add(1);
         Ok(Some(entry))
