@@ -66,6 +66,8 @@ struct Inner {
     background_error: Mutex<Option<String>>,
     snapshot_registry: Mutex<SnapshotRegistry>,
     obsolete_table_files: Mutex<Vec<ObsoleteTableFile>>,
+    #[cfg(test)]
+    compaction_test_fail_after_output_entries: Mutex<Option<usize>>,
 }
 
 struct WriteState {
@@ -159,6 +161,29 @@ struct CompactionSelection {
     max_key: Key,
 }
 
+struct CompactionPlan {
+    reason: CompactionReason,
+    reserved_table_id: u64,
+    db_dir: PathBuf,
+    settings: SstableWriteSettings,
+    removed_tables: Vec<SsTableMeta>,
+    removed_ids: HashSet<u64>,
+    input_l0_table_ids: Vec<u64>,
+    input_l1_table_ids: Vec<u64>,
+    drop_tombstones: bool,
+    sources: Vec<TableSource>,
+}
+
+struct CompactionOutput {
+    output_entries: usize,
+    output_table_ids: Vec<u64>,
+    new_l1_table: Option<TableHandle>,
+}
+
+struct CompactionCommit {
+    obsolete_files: Vec<ObsoleteTableFile>,
+}
+
 #[derive(Clone)]
 struct SstableWriteSettings {
     block_target_bytes: usize,
@@ -172,6 +197,12 @@ struct SstableWriteSettings {
 struct BackgroundTaskChannels {
     flush_tx: SyncSender<FlushJob>,
     compaction_tx: SyncSender<CompactionJob>,
+}
+
+const fn compaction_reason_label(reason: CompactionReason) -> &'static str {
+    match reason {
+        CompactionReason::L0ThresholdReached => "l0_threshold_reached",
+    }
 }
 
 impl AetherEngine {
@@ -258,6 +289,8 @@ impl AetherEngine {
                 background_error: Mutex::new(None),
                 snapshot_registry: Mutex::new(SnapshotRegistry::default()),
                 obsolete_table_files: Mutex::new(pending_obsolete_files),
+                #[cfg(test)]
+                compaction_test_fail_after_output_entries: Mutex::new(None),
             }),
         };
 
@@ -829,19 +862,83 @@ impl AetherEngine {
         result
     }
 
-    fn handle_compaction_job(&self, _job: CompactionJob) -> Result<()> {
+    fn handle_compaction_job(&self, job: CompactionJob) -> Result<()> {
         let compaction_started_at = Instant::now();
 
-        let mut write_state = self.inner.write_state.lock();
-        let mut read_state = self.inner.read_state.write();
-
-        if read_state.table_cache.l0.len() < self.inner.l0_compaction_trigger.max(1) {
+        let maybe_plan = {
+            let mut write_state = self.inner.write_state.lock();
+            let read_state = self.inner.read_state.read();
+            self.capture_compaction_plan(job, &mut write_state, &read_state)?
+        };
+        let Some(plan) = maybe_plan else {
             return Ok(());
+        };
+
+        let reason = compaction_reason_label(plan.reason);
+        let input_l0_table_ids = plan.input_l0_table_ids.clone();
+        let input_l1_table_ids = plan.input_l1_table_ids.clone();
+        info!(
+            event = "compaction.start",
+            reason,
+            input_l0_tables = input_l0_table_ids.len(),
+            input_l1_tables = input_l1_table_ids.len(),
+            ?input_l0_table_ids,
+            ?input_l1_table_ids,
+            "compaction started"
+        );
+
+        let output = self.stream_compaction_output(&plan)?;
+        let output_entries = output.output_entries;
+        let output_table_ids = output.output_table_ids.clone();
+
+        let commit = {
+            let mut write_state = self.inner.write_state.lock();
+            let mut read_state = self.inner.read_state.write();
+            Self::apply_compaction_commit(&mut write_state, &mut read_state, &plan, output)?
+        };
+
+        self.enqueue_obsolete_tables(commit.obsolete_files);
+        self.try_cleanup_obsolete_tables();
+
+        self.inner
+            .metrics
+            .record_compaction_with_duration(compaction_started_at.elapsed());
+        info!(
+            event = "compaction.end",
+            reason,
+            input_l0_tables = input_l0_table_ids.len(),
+            input_l1_tables = input_l1_table_ids.len(),
+            output_tables = output_table_ids.len(),
+            output_entries,
+            ?output_table_ids,
+            elapsed_ms = compaction_started_at.elapsed().as_millis(),
+            "compaction completed"
+        );
+        self.maybe_emit_metrics_snapshot("compaction");
+        Ok(())
+    }
+
+    fn capture_compaction_plan(
+        &self,
+        job: CompactionJob,
+        write_state: &mut WriteState,
+        read_state: &ReadState,
+    ) -> Result<Option<CompactionPlan>> {
+        if read_state.table_cache.l0.len() < self.inner.l0_compaction_trigger.max(1) {
+            return Ok(None);
         }
 
         let Some(selection) = CompactionSelection::from_cache(&read_state.table_cache)? else {
-            return Ok(());
+            return Ok(None);
         };
+
+        let reserved_table_id = write_state.manifest.next_table_id;
+        write_state.manifest.next_table_id = write_state
+            .manifest
+            .next_table_id
+            .checked_add(1)
+            .ok_or_else(|| invalid_data("SSTable table-id overflow"))?;
+
         let input_l0_table_ids = selection
             .selected_l0
             .iter()
@@ -852,85 +949,124 @@ impl AetherEngine {
             .iter()
             .map(|meta| meta.table_id)
             .collect::<Vec<_>>();
-        info!(
-            event = "compaction.start",
-            reason = "l0_threshold_reached",
-            input_l0_tables = input_l0_table_ids.len(),
-            input_l1_tables = input_l1_table_ids.len(),
-            ?input_l0_table_ids,
-            ?input_l1_table_ids,
-            "compaction started"
-        );
+        let removed_tables = collect_removed_tables(&selection);
+        let removed_ids = removed_tables
+            .iter()
+            .map(|meta| meta.table_id)
+            .collect::<HashSet<_>>();
+        let drop_tombstones = can_drop_compaction_tombstones(&read_state.table_cache, &selection);
+        let sources = capture_compaction_sources(&read_state.table_cache, &selection)?;
 
-        let output_entries = collect_compaction_entries(&read_state.table_cache, &selection)?;
-        let new_l1_table = if output_entries.is_empty() {
-            None
-        } else {
-            let table_id = write_state.manifest.next_table_id;
-            write_state.manifest.next_table_id = write_state
-                .manifest
-                .next_table_id
-                .checked_add(1)
-                .ok_or_else(|| invalid_data("SSTable table-id overflow"))?;
+        Ok(Some(CompactionPlan {
+            reason: job.reason,
+            reserved_table_id,
+            db_dir: write_state.db_dir.clone(),
+            settings: sstable_write_settings(&self.inner),
+            removed_tables,
+            removed_ids,
+            input_l0_table_ids,
+            input_l1_table_ids,
+            drop_tombstones,
+            sources,
+        }))
+    }
 
-            let settings = sstable_write_settings(&self.inner);
-            Some(write_entries_to_sstable(
-                &write_state.db_dir,
-                &output_entries,
-                table_id,
-                1,
-                &settings,
-            )?)
+    fn stream_compaction_output(&self, plan: &CompactionPlan) -> Result<CompactionOutput> {
+        #[cfg(not(test))]
+        let _ = &self.inner;
+
+        let source_cursors = build_compaction_source_cursors(&plan.sources)?;
+        let mut merge_iter = MergeIterator::new(MergeMode::Compaction, source_cursors);
+
+        let output_path = sstable_path(&plan.db_dir, plan.reserved_table_id, 1);
+        let stream_result: Result<(usize, Option<TableHandle>)> = (|| {
+            let mut writer = None;
+            let mut output_entries = 0_usize;
+
+            while let Some(entry) = merge_iter.next_entry()? {
+                if plan.drop_tombstones && matches!(entry.value, ValueEntry::Tombstone) {
+                    continue;
+                }
+
+                if writer.is_none() {
+                    writer = Some(create_sstable_writer(
+                        &output_path,
+                        plan.reserved_table_id,
+                        1,
+                        &plan.settings,
+                    )?);
+                }
+                if let Some(active_writer) = writer.as_mut() {
+                    active_writer.add_entry(&entry)?;
+                }
+                output_entries = output_entries
+                    .checked_add(1)
+                    .ok_or_else(|| invalid_data("compaction output entry count overflow"))?;
+                #[cfg(test)]
+                self.maybe_inject_compaction_stream_failure(output_entries)?;
+            }
+
+            let new_l1_table = if let Some(active_writer) = writer {
+                let meta = active_writer.finish()?;
+                let reader = SsTableReader::open(
+                    &output_path,
+                    meta.clone(),
+                    plan.settings.enable_mmap_reads,
+                    plan.settings.block_cache.clone(),
+                )?;
+                Some(TableHandle {
+                    meta,
+                    reader: Arc::new(reader),
+                })
+            } else {
+                None
+            };
+
+            Ok((output_entries, new_l1_table))
+        })();
+        let (output_entries, new_l1_table) = match stream_result {
+            Ok(ok) => ok,
+            Err(err) => {
+                cleanup_partial_compaction_output(&output_path);
+                return Err(err);
+            }
         };
         let output_table_ids = new_l1_table
             .as_ref()
             .map(|table| vec![table.meta.table_id])
             .unwrap_or_default();
 
-        let removed_tables = collect_removed_tables(&selection);
-        let removed_ids = removed_tables
-            .iter()
-            .map(|meta| meta.table_id)
-            .collect::<HashSet<_>>();
+        Ok(CompactionOutput {
+            output_entries,
+            output_table_ids,
+            new_l1_table,
+        })
+    }
 
+    fn apply_compaction_commit(
+        write_state: &mut WriteState,
+        read_state: &mut ReadState,
+        plan: &CompactionPlan,
+        output: CompactionOutput,
+    ) -> Result<CompactionCommit> {
         apply_compaction_manifest_changes(
             &mut write_state.manifest,
-            &removed_ids,
-            &removed_tables,
-            new_l1_table.as_ref(),
+            &plan.removed_ids,
+            &plan.removed_tables,
+            output.new_l1_table.as_ref(),
         );
 
         ManifestStore::commit(&write_state.db_dir, &write_state.manifest)?;
 
-        read_state.table_cache.remove_tables(&removed_ids);
-        if let Some(table) = new_l1_table {
+        read_state.table_cache.remove_tables(&plan.removed_ids);
+        if let Some(table) = output.new_l1_table {
             read_state.table_cache.insert(table);
         }
         read_state.manifest_snapshot = write_state.manifest.clone();
 
-        let obsolete_files = obsolete_table_files_from_metas(&write_state.db_dir, &removed_tables);
-        drop(read_state);
-        drop(write_state);
-
-        self.enqueue_obsolete_tables(obsolete_files);
-        self.try_cleanup_obsolete_tables();
-
-        self.inner
-            .metrics
-            .record_compaction_with_duration(compaction_started_at.elapsed());
-        info!(
-            event = "compaction.end",
-            reason = "l0_threshold_reached",
-            input_l0_tables = input_l0_table_ids.len(),
-            input_l1_tables = input_l1_table_ids.len(),
-            output_tables = output_table_ids.len(),
-            output_entries = output_entries.len(),
-            ?output_table_ids,
-            elapsed_ms = compaction_started_at.elapsed().as_millis(),
-            "compaction completed"
-        );
-        self.maybe_emit_metrics_snapshot("compaction");
-        Ok(())
+        let obsolete_files =
+            obsolete_table_files_from_metas(&write_state.db_dir, &plan.removed_tables);
+        Ok(CompactionCommit { obsolete_files })
     }
 
     fn maybe_emit_metrics_snapshot(&self, reason: &'static str) {
@@ -972,6 +1108,21 @@ impl AetherEngine {
         if slot.is_none() {
             *slot = Some(message);
         }
+    }
+
+    #[cfg(test)]
+    fn set_compaction_test_fail_after_output_entries(&self, fail_after: Option<usize>) {
+        let mut slot = self.inner.compaction_test_fail_after_output_entries.lock();
+        *slot = fail_after;
+    }
+
+    #[cfg(test)]
+    fn maybe_inject_compaction_stream_failure(&self, output_entries: usize) -> Result<()> {
+        let fail_after = *self.inner.compaction_test_fail_after_output_entries.lock();
+        if fail_after.is_some_and(|threshold| output_entries >= threshold) {
+            return Err(invalid_data("injected compaction stream failure").into());
+        }
+        Ok(())
     }
 
     fn ensure_background_workers_healthy(&self) -> Result<()> {
@@ -1322,29 +1473,10 @@ impl CompactionSelection {
     }
 }
 
-fn collect_compaction_entries(
+fn capture_compaction_sources(
     table_cache: &TableCache,
     selection: &CompactionSelection,
-) -> Result<Vec<InternalEntry>> {
-    let sources = build_compaction_sources(table_cache, selection)?;
-    let drop_tombstones = can_drop_compaction_tombstones(table_cache, selection);
-
-    let mut output_entries = Vec::new();
-    let mut merge_iter = MergeIterator::new(MergeMode::Compaction, sources);
-    while let Some(entry) = merge_iter.next_entry()? {
-        if drop_tombstones && matches!(entry.value, ValueEntry::Tombstone) {
-            continue;
-        }
-        output_entries.push(entry);
-    }
-
-    Ok(output_entries)
-}
-
-fn build_compaction_sources(
-    table_cache: &TableCache,
-    selection: &CompactionSelection,
-) -> Result<Vec<SourceCursor>> {
+) -> Result<Vec<TableSource>> {
     let selected_l0_ids = selection
         .selected_l0
         .iter()
@@ -1368,8 +1500,10 @@ fn build_compaction_sources(
         let source_rank = SOURCE_RANK_L0_BASE
             .checked_add(offset)
             .ok_or_else(|| invalid_data("L0 source-rank overflow"))?;
-        let iter = table.reader.iter_all()?;
-        sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
+        sources.push(TableSource {
+            reader: Arc::clone(&table.reader),
+            source_rank,
+        });
     }
 
     for (index, table) in table_cache.l1.iter().enumerate() {
@@ -1382,11 +1516,22 @@ fn build_compaction_sources(
         let source_rank = SOURCE_RANK_L1_BASE
             .checked_add(offset)
             .ok_or_else(|| invalid_data("L1 source-rank overflow"))?;
-        let iter = table.reader.iter_all()?;
-        sources.push(SourceCursor::from_sstable_iter(iter, source_rank));
+        sources.push(TableSource {
+            reader: Arc::clone(&table.reader),
+            source_rank,
+        });
     }
 
     Ok(sources)
+}
+
+fn build_compaction_source_cursors(sources: &[TableSource]) -> Result<Vec<SourceCursor>> {
+    let mut cursors = Vec::with_capacity(sources.len());
+    for source in sources {
+        let iter = source.reader.iter_all()?;
+        cursors.push(SourceCursor::from_sstable_iter(iter, source.source_rank));
+    }
+    Ok(cursors)
 }
 
 fn can_drop_compaction_tombstones(
@@ -1565,6 +1710,21 @@ fn obsolete_table_file(db_dir: &Path, table_id: u64, level: u8, max_seq: u64) ->
     }
 }
 
+fn cleanup_partial_compaction_output(path: &Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            error!(
+                event = "compaction.cleanup_partial_output_error",
+                path = %path.display(),
+                error = %err,
+                "failed to cleanup partial compaction output"
+            );
+        }
+    }
+}
+
 fn parse_sstable_filename(file_name: &str) -> Option<(u8, u64)> {
     let stem = file_name.strip_suffix(&format!(".{SSTABLE_FILE_EXT}"))?;
     let (level_part, table_part) = stem.split_once("-t")?;
@@ -1693,18 +1853,7 @@ fn write_entries_to_sstable(
     }
 
     let path = sstable_path(db_dir, table_id, level);
-    let mut writer = SsTableWriter::create_with_block_target_and_options(
-        &path,
-        table_id,
-        level,
-        settings.block_target_bytes,
-        FooterMetadata {
-            block_encoding_kind: BlockEncodingKind::Prefix,
-            default_compression_codec: settings.compression_codec.into(),
-            prefix_restart_interval: settings.prefix_restart_interval,
-        },
-        settings.min_compress_size_bytes,
-    )?;
+    let mut writer = create_sstable_writer(&path, table_id, level, settings)?;
     for entry in entries {
         writer.add_entry(entry)?;
     }
@@ -1720,6 +1869,26 @@ fn write_entries_to_sstable(
         meta,
         reader: Arc::new(reader),
     })
+}
+
+fn create_sstable_writer(
+    path: &Path,
+    table_id: u64,
+    level: u8,
+    settings: &SstableWriteSettings,
+) -> Result<SsTableWriter> {
+    SsTableWriter::create_with_block_target_and_options(
+        path,
+        table_id,
+        level,
+        settings.block_target_bytes,
+        FooterMetadata {
+            block_encoding_kind: BlockEncodingKind::Prefix,
+            default_compression_codec: settings.compression_codec.into(),
+            prefix_restart_interval: settings.prefix_restart_interval,
+        },
+        settings.min_compress_size_bytes,
+    )
 }
 
 fn table_file_size_bytes(db_dir: &Path, table_id: u64, level: u8) -> Result<u64> {
@@ -2880,6 +3049,47 @@ mod tests {
         assert!(
             wait_for_path_missing(&l0_t1),
             "obsolete L0 table 1 should be deleted without snapshots"
+        );
+
+        drop(engine);
+        cleanup_db_dir(&db_dir);
+    }
+
+    #[test]
+    fn compaction_stream_failure_cleans_partial_output_file() {
+        let db_dir = temp_db_dir("compaction-stream-failure-cleanup");
+        let mut opts = EngineOptions::with_db_dir(db_dir.clone());
+        opts.l0_compaction_trigger = 2;
+
+        let engine = match AetherEngine::open(opts) {
+            Ok(engine) => engine,
+            Err(err) => panic!("open should succeed: {err}"),
+        };
+        engine.set_compaction_test_fail_after_output_entries(Some(1));
+
+        if let Err(err) = engine.put(Bytes::from_static(b"a"), Bytes::from_static(b"1")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+        if let Err(err) = engine.put(Bytes::from_static(b"b"), Bytes::from_static(b"2")) {
+            panic!("put should succeed: {err}");
+        }
+        if let Err(err) = engine.flush() {
+            panic!("flush should succeed: {err}");
+        }
+
+        let l1_t2 = sstable_path(&db_dir, 2, 1);
+        assert!(
+            wait_until(Duration::from_secs(2), || {
+                engine.inner.write_state.lock().manifest.next_table_id >= 3
+            }),
+            "compaction should reserve an output table id"
+        );
+        assert!(
+            wait_for_path_missing(&l1_t2),
+            "partial compaction output SST should be cleaned on stream failure"
         );
 
         drop(engine);
